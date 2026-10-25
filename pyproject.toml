@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meshport"
+dynamic = ["version"]
+description = "Read and write FBX and glTF in pure Python. No SDK, no 3D app."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Pure Tech" }]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+keywords = ["fbx", "gltf", "glb", "3d", "mesh", "converter"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+
+[project.optional-dependencies]
+images = ["Pillow>=10"]  # re-encode TGA/TIFF/PSD/... textures to PNG for glTF
+dev = ["pytest>=8", "Pillow>=10", "trimesh>=4"]
+
+[project.scripts]
+meshport = "meshport.__main__:main"
+
+[project.urls]
+Source = "https://github.com/puretechteam/meshport"
+
+[tool.setuptools.dynamic]
+version = { attr = "meshport.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
