@@ -121,6 +121,7 @@ class _Reader:
         self.children: dict[object, list[tuple[str, object, str | None]]] = {}  # parent -> [(kind, child, prop)]
         self.parent_of: dict[object, list[object]] = {}
         self.images: dict[object, Image] = {}
+        self.finder = TextureFinder(base_dir)
         self._load_templates()
         self._load_objects()
         self._load_connections()
@@ -466,10 +467,22 @@ class _Reader:
         self.images[tex.id] = image
         return image
 
-    _TEXTURE_DIRS = frozenset({"texture", "textures", "tex", "materials", "images", "maps"})
-
     def _find_file(self, names: list[str]) -> bytes | None:
-        """Texture paths in FBX files usually point at the artist's own drive. Try the path
+        return self.finder.find(names)
+
+
+_TEXTURE_DIRS = frozenset({"texture", "textures", "tex", "materials", "images", "maps"})
+
+
+class TextureFinder:
+    """Finds the texture files a model points at. Shared by the FBX and 3DS readers."""
+
+    def __init__(self, base_dir: Path | None):
+        self.base_dir = base_dir
+        self._files: dict[str, Path] | None = None
+
+    def find(self, names: list[str]) -> bytes | None:
+        """Texture paths in model files usually point at the artist's own drive. Try the path
         as written, then the file name next to the model, in texture folders up to two
         levels above it (Pack/Models/x.fbx -> Pack/Textures/), and finally anywhere under
         the folder above the model."""
@@ -499,7 +512,7 @@ class _Reader:
     def _listing(self) -> dict[str, Path]:
         """Lower-case file name -> path, nearest folders first, capped so a model in a huge
         folder doesn't stall the read."""
-        if hasattr(self, "_files"):
+        if self._files is not None:
             return self._files
         files: dict[str, Path] = {}
 
@@ -516,7 +529,7 @@ class _Reader:
             add(fbm)
         for up in (self.base_dir, self.base_dir.parent, self.base_dir.parent.parent):
             try:
-                subdirs = [d for d in up.iterdir() if d.is_dir() and d.name.lower() in self._TEXTURE_DIRS]
+                subdirs = [d for d in up.iterdir() if d.is_dir() and d.name.lower() in _TEXTURE_DIRS]
             except OSError:
                 subdirs = []
             for d in subdirs:

@@ -1,6 +1,6 @@
 # meshport
 
-Read and write FBX and glTF in pure Python. No FBX SDK, no 3D app, no compiled code: just NumPy.
+Read and write FBX, glTF and 3DS in pure Python. No FBX SDK, no 3D app, no compiled code: just NumPy.
 
 What's new: see the [changelog](CHANGELOG.md).
 
@@ -97,6 +97,7 @@ ConvertAll still uses Blender for `.blend`, USD and Alembic.
 | FBX binary, 6.x and 7.x (2006 onward, either byte order) | ✓ | ✓ (7.4, the version every importer accepts) |
 | FBX ASCII, 6.x and 7.x | ✓ | – |
 | glTF 2.0 (`.gltf`, `.glb`) | ✓ | ✓ (everything embedded in one file) |
+| Autodesk 3DS (`.3ds`) | ✓ | ✓ (with texture files; big meshes split to fit the format) |
 | Wavefront OBJ | – | ✓ (with .mtl and texture files) |
 
 What comes across in both directions:
@@ -108,6 +109,15 @@ What comes across in both directions:
 - **Materials.** Per-face materials, base color, opacity, emissive, roughness (from FBX shininess), and base color, normal and emissive textures. FBX textures can be embedded or external. External ones are found even when the file still points at the original artist's drive: meshport looks next to the model and in `Textures/` folders up to two levels above it.
 
 Not handled: animation, skinning, blend shapes, cameras and lights. Rigged characters come out in their bind pose. glTF files compressed with Draco or meshopt are refused with a clear error.
+
+3DS is an old format with hard limits, so a few things change on the way out:
+
+- Meshes are triangles, with at most 65,535 vertices and 65,535 faces per object. Bigger meshes are split into several objects.
+- There is one UV set, and normals are stored as smoothing groups. Vertices are split wherever a UV or normal changes, so hard edges stay hard.
+- There is no hierarchy: every mesh is written as its own object, in place.
+- Object names are cut to 10 characters and material names to 16, kept unique. Texture files get 8.3 names, which every 3DS reader accepts.
+
+When reading 3DS, the keyframer section (animation and hierarchy), lights and cameras are skipped.
 
 Textures that glTF can't hold (TGA, PSD, TIFF, ...) are re-encoded to PNG when [Pillow](https://pypi.org/project/Pillow/) is installed (`pip install meshport[images]`), and left out otherwise.
 
@@ -138,7 +148,7 @@ Conventions are glTF's: right-handed, +Y up, 1 unit = 1 meter. UVs have v = 0 at
 
   Where a file has back-to-back duplicate faces (two-sided walls), Blender deletes them and meshport keeps them.
 - **Against ufbx and Assimp.** See [Why meshport?](#why-meshport) and `benchmarks/compare_readers.py`.
-- **The test suite** (`pytest`) builds its own files. It checks round trips, hand-written ASCII 6 and 7 files, every transform feature, glTF corner cases (interleaved buffers, sparse accessors, strips, external buffers) and, when Blender is installed, both directions of Blender interop.
+- **The test suite** (`pytest`) builds its own files. It checks round trips, hand-written ASCII 6 and 7 files, every transform feature, glTF corner cases (interleaved buffers, sparse accessors, strips, external buffers), 3DS smoothing groups and mesh splitting, damaged and hostile files in every format and, when Blender is installed, both directions of Blender interop.
 
 ## Development
 
@@ -153,6 +163,7 @@ Code layout:
 - `src/meshport/fbxtree.py`: FBX as a raw record tree (binary and ASCII parsing, binary writing).
 - `src/meshport/fbx.py`: the record tree ↔ `Scene`.
 - `src/meshport/gltf.py`: glTF ↔ `Scene`.
+- `src/meshport/max3ds.py`: 3DS ↔ `Scene`.
 - `src/meshport/obj.py`: `Scene` → OBJ.
 - `src/meshport/geometry.py`: transforms and triangulation.
 

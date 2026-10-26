@@ -8,17 +8,17 @@ import numpy as np
 import pytest
 
 import meshport
-from meshport import MeshportError, fbx
+from meshport import MeshportError, fbx, max3ds
 from meshport.fbxtree import Record, write_ascii, write_binary
 
 
 def _samples(scene):
     return {"fbx": meshport.write(scene, "fbx"), "glb": meshport.write(scene, "glb"),
-            "gltf": meshport.write(scene, "gltf"),
+            "gltf": meshport.write(scene, "gltf"), "3ds": meshport.write(scene, "3ds"),
             "ascii": write_ascii(fbx._Writer(scene).records()).encode()}
 
 
-@pytest.mark.parametrize("kind", ["fbx", "glb", "gltf", "ascii"])
+@pytest.mark.parametrize("kind", ["fbx", "glb", "gltf", "ascii", "3ds"])
 def test_corrupted_files_raise_meshport_error(scene, kind):
     data = _samples(scene)[kind]
     fmt = "fbx" if kind == "ascii" else kind
@@ -62,3 +62,54 @@ def test_deep_nesting_is_an_error_not_a_crash():
         sys.setrecursionlimit(old)
     with pytest.raises(MeshportError):
         fbx.read(data)
+
+
+def _3ds(*edit: bytes) -> bytes:
+    return max3ds._chunk(max3ds.MAIN, max3ds._chunk(max3ds.EDIT, *edit))
+
+
+def _3ds_mesh(*parts: bytes) -> bytes:
+    return _3ds(max3ds._chunk(max3ds.OBJECT, b"x\0", max3ds._chunk(max3ds.TRIMESH, *parts)))
+
+
+@pytest.mark.parametrize("data", [
+    # a chunk shorter than its own header, which would loop forever if trusted
+    b"MM" + struct.pack("<I", 18) + b"==" + struct.pack("<I", 0) + bytes(6),
+    # a chunk that claims more bytes than its parent holds
+    _3ds(struct.pack("<HI", max3ds.OBJECT, 1000) + b"x\0"),
+    # 65,535 points claimed, 1 sent
+    _3ds_mesh(max3ds._chunk(max3ds.POINT_ARRAY, struct.pack("<H3f", 65535, 0, 0, 0))),
+    # 65,535 faces claimed, none sent
+    _3ds_mesh(max3ds._chunk(max3ds.POINT_ARRAY, struct.pack("<H", 0)),
+              max3ds._chunk(max3ds.FACE_ARRAY, struct.pack("<H", 65535))),
+    # a name with no end
+    _3ds(max3ds._chunk(max3ds.OBJECT, b"no terminator")),
+])
+def test_hostile_3ds_raises_meshport_error(data):
+    with pytest.raises(MeshportError):
+        meshport.read(data, "3ds")
+
+
+def test_3ds_odd_but_readable_parts_are_tolerated():
+    points = max3ds._chunk(max3ds.POINT_ARRAY, struct.pack("<H", 3), np.eye(3, dtype="<f4").tobytes())
+    group = max3ds._chunk(max3ds.MSH_MAT_GROUP, b"nowhere\0", struct.pack("<HHH", 2, 0, 40000))  # face 40000 doesn't exist
+    smooth = max3ds._chunk(max3ds.SMOOTH_GROUP, b"")  # fewer smoothing entries than faces
+    faces = max3ds._chunk(max3ds.FACE_ARRAY, struct.pack("<H4H", 1, 0, 1, 2, 0), group, smooth)
+    uvs = max3ds._chunk(max3ds.TEX_VERTS, struct.pack("<H2f", 1, 0, 0))  # fewer UVs than points
+    singular = max3ds._chunk(max3ds.MESH_MATRIX, bytes(48))
+    scene = meshport.read(_3ds_mesh(points, uvs, singular, faces), "3ds")
+    mesh = scene.roots[0].mesh
+    assert len(mesh.face_sizes) == 1 and mesh.uvs == [] and mesh.normals is not None
+    assert scene.roots[0].materials[0].name == "nowhere"
+
+
+def test_3ds_many_smoothing_masks_stay_fast():
+    rng = np.random.default_rng(0)
+    n = 20_000
+    p = rng.random((n + 2, 3)).astype("<f4")
+    tris = np.stack([np.arange(n), np.arange(n) + 1, np.arange(n) + 2, np.zeros(n)], 1).astype("<u2")
+    masks = rng.integers(1, 2**32, n, dtype=np.uint64).astype("<u4")  # every face its own mix of groups
+    data = _3ds_mesh(max3ds._chunk(max3ds.POINT_ARRAY, struct.pack("<H", n + 2), p.tobytes()),
+                     max3ds._chunk(max3ds.FACE_ARRAY, struct.pack("<H", n), tris.tobytes(),
+                                   max3ds._chunk(max3ds.SMOOTH_GROUP, masks.tobytes())))
+    assert meshport.read(data, "3ds").roots[0].mesh.normals.shape == (3 * n, 3)

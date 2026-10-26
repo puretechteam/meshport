@@ -1,5 +1,6 @@
 """Checks against other software. Each test skips when that software isn't installed."""
 
+import json
 import subprocess
 import textwrap
 
@@ -75,3 +76,51 @@ def test_we_read_blenders_fbx(tmp_path):
     # the FBX was exported Z-up with a 2x global scale; the GLB is the plain scene
     gap = _vertex_gap(meshport.load(tmp_path / "blender.fbx"), meshport.load(tmp_path / "blender.glb"), 2.0)
     assert gap < 1e-4
+
+
+_BLENDER_3DS_SCRIPT = textwrap.dedent("""
+    import addon_utils, bpy, json, sys
+    src, out = sys.argv[sys.argv.index("--") + 1:]
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+
+    def have_importer():
+        try:
+            return bool(bpy.ops.import_scene.max3ds.get_rna_type())
+        except KeyError:
+            return False
+
+    # Blender 4.2+ ships the 3DS importer as an extension, older versions as a bundled add-on.
+    for module in ("io_scene_3ds", "bl_ext.blender_org.io_scene_3ds", "bl_ext.user_default.io_scene_3ds"):
+        try:
+            addon_utils.enable(module, default_set=False)
+        except Exception:
+            pass
+        if have_importer():
+            break
+    if have_importer():
+        names = bpy.ops.import_scene.max3ds.get_rna_type().properties.keys()
+        options = {"constrain_size": 0.0} if "constrain_size" in names else {}
+        bpy.ops.import_scene.max3ds(filepath=src, **options)
+        meshes = [[len(o.data.vertices), len(o.data.polygons)] for o in bpy.data.objects if o.type == "MESH"]
+        report = {"meshes": sorted(meshes)}
+    else:
+        report = {"skip": "Blender's 3DS importer (io_scene_3ds) isn't installed"}
+    with open(out, "w") as f:
+        json.dump(report, f)
+""")
+
+
+@pytest.mark.skipif(BLENDER is None, reason="Blender isn't installed")
+def test_blender_reads_our_3ds(scene, tmp_path):
+    meshport.save(scene, tmp_path / "ours.3ds")
+    script = tmp_path / "script3ds.py"
+    script.write_text(_BLENDER_3DS_SCRIPT)
+    subprocess.run([BLENDER, "-b", "--factory-startup", "-noaudio", "--python-exit-code", "1", "--python", str(script),
+                    "--", str(tmp_path / "ours.3ds"), str(tmp_path / "blender.json")],
+                   check=True, capture_output=True, timeout=300)
+    report = json.loads((tmp_path / "blender.json").read_text())
+    if "skip" in report:
+        pytest.skip(report["skip"])
+    ours = meshport.load(tmp_path / "ours.3ds")
+    want = sorted([len(n.mesh.positions), len(n.mesh.face_sizes)] for n, _ in ours.walk() if n.mesh is not None)
+    assert report["meshes"] == want

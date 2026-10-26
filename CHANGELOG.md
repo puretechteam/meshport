@@ -2,6 +2,17 @@
 
 Newest first. Each entry is dated by when it landed.
 
+## 2026-10-25: meshport 0.2.0, Autodesk 3DS
+
+- **Added:** reading and writing `.3ds` files (`meshport.load`/`save`, `meshport.read`/`write` with `"3ds"`, and the command line).
+  - Reads mesh objects with their UVs, smoothing groups (turned into normals), per-face materials and object matrices, and materials with their diffuse color, opacity, shininess, two-sided flag, self-illumination, and texture, bump and self-illumination maps. Textures are found next to the model the same way as for FBX.
+  - Writes every mesh as an object in world space. Meshes over the format's 65,535-vertex or 65,535-face limit are split into several objects. Hard edges are kept by splitting vertices under one smoothing group.
+  - Names are cut to the format's limits (10 characters for objects, 16 for materials, 8.3 for texture files) and kept unique. `save()` writes the texture files next to the `.3ds`.
+  - Skipped when reading: the keyframer section (animation and hierarchy), lights and cameras.
+- **Added:** 3DS tests: round trips, smoothing groups, splitting, name limits, damaged and hostile files, and a check that Blender's 3DS importer reads meshport's files (skipped when Blender or its `io_scene_3ds` extension isn't installed).
+- **Changed:** the FBX reader's texture search is now shared with the 3DS reader.
+- **Changed:** the code passes `ruff check` with ruff 0.16's wider default rules. No behavior changes.
+
 ## 2026-10-25: Sturdier against damaged files
 
 - **Fixed:** damaged or deliberately malformed files now always raise `MeshportError`. Before, a corrupted GLB or glTF could raise a raw `UnicodeDecodeError`, `KeyError` or `IndexError`, and a deeply nested FBX could hit a `RecursionError`. Found by feeding meshport 1,600 corrupted files.

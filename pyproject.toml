@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "meshport"
 dynamic = ["version"]
-description = "Read and write FBX and glTF in pure Python. No SDK, no 3D app."
+description = "Read and write FBX, glTF and 3DS in pure Python. No SDK, no 3D app."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Pure Tech" }]
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
-keywords = ["fbx", "gltf", "glb", "3d", "mesh", "converter"]
+keywords = ["fbx", "gltf", "glb", "3ds", "3d", "mesh", "converter"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Multimedia :: Graphics :: 3D Modeling",
