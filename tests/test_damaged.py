@@ -66,13 +66,7 @@ def test_deep_nesting_is_an_error_not_a_crash():
     rec = Record("Deep")
     for _ in range(3000):
         rec = Record("Deep", children=[rec])
-    import sys
-    old = sys.getrecursionlimit()
-    sys.setrecursionlimit(10000)  # enough to write it; the reader runs at the normal limit
-    try:
-        data = write_binary([Record("Objects", children=[rec])])
-    finally:
-        sys.setrecursionlimit(old)
+    data = write_binary([Record("Objects", children=[rec])])  # the writer doesn't recurse
     with pytest.raises(MeshportError):
         fbx.read(data)
 

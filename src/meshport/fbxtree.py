@@ -177,18 +177,26 @@ def write_binary(records: list[Record], version: int = 7400) -> bytes:
 
 
 def _write_record(out: bytearray, rec: Record, head: struct.Struct) -> None:
-    start = len(out)
-    name = rec.name.encode("ascii")
-    out += bytes(head.size) + name
-    props_start = len(out)
-    for p in rec.props:
-        _write_prop(out, p)
-    props_len = len(out) - props_start
-    for child in rec.children:
-        _write_record(out, child, head)
-    if rec.children or not rec.props:
-        out += bytes(head.size)
-    head.pack_into(out, start, len(out), len(rec.props), props_len, len(name))
+    """Write rec and everything under it. A loop rather than recursion, so no depth of nesting
+    can overflow the stack (Python 3.10 on Windows crashes outright at a few thousand levels)."""
+    todo: list[tuple[Record, bool]] = [(rec, False)]
+    open_records: list[tuple[int, int]] = []  # (header offset, property bytes) of records not yet closed
+    while todo:
+        r, closing = todo.pop()
+        if closing:
+            start, props_len = open_records.pop()
+            if r.children or not r.props:
+                out += bytes(head.size)
+            head.pack_into(out, start, len(out), len(r.props), props_len, len(r.name.encode("ascii")))
+            continue
+        start = len(out)
+        out += bytes(head.size) + r.name.encode("ascii")
+        props_start = len(out)
+        for p in r.props:
+            _write_prop(out, p)
+        open_records.append((start, len(out) - props_start))
+        todo.append((r, True))
+        todo.extend((child, False) for child in reversed(r.children))
 
 
 _ARRAY_CODE = {np.dtype("float32"): b"f", np.dtype("float64"): b"d", np.dtype("int64"): b"l",

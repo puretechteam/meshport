@@ -2,6 +2,10 @@
 
 Newest first. Each entry is dated by when it landed.
 
+## 2026-10-26: The FBX writer can't overflow the stack (after the 0.2.0 tag)
+
+- **Fixed:** writing an FBX file nested a few thousand levels deep crashed Python 3.10 on Windows with a stack overflow. The writer now uses a loop instead of recursion, so any depth works. Its output is byte for byte the same. Found by the new GitHub Actions run on Python 3.10.
+
 ## 2026-10-26: Texture paths can't reach other files (part of 0.2.0)
 
 - **Fixed (security):** a model's texture paths could name any file on the computer, and meshport would copy it into the FBX, 3DS or OBJ it wrote. A hostile model from the internet could use this to slip private files into a converted copy that then gets shared. Now:
