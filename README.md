@@ -2,6 +2,8 @@
 
 Read and write FBX and glTF in pure Python. No FBX SDK, no 3D app, no compiled code: just NumPy.
 
+What's new: see the [changelog](CHANGELOG.md).
+
 ```
 pip install meshport
 meshport character.fbx character.glb
