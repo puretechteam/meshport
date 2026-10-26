@@ -19,10 +19,10 @@ from pathlib import Path
 import numpy as np
 
 from . import __version__
-from .fbxtree import CREATION_TIME, FILE_ID, Record, as_array, decode_content, parse, write_binary
+from .fbxtree import CREATION_TIME, FILE_ID, Record, decode_content, parse, write_binary
 from .geometry import (EULER_ORDERS, compose, decompose, euler, scaling, transform_normals, transform_points,
                        translation, unique_rows)
-from .scene import Image, Material, Mesh, MeshportError, Node, Scene
+from .scene import DAMAGED, Image, Material, Mesh, MeshportError, Node, Scene
 
 # ============================================================================ reading
 
@@ -44,7 +44,7 @@ class _Obj:
         vals = self.props.get(name, self.template.get(name))
         if not vals:
             return default
-        if isinstance(default, tuple) or (isinstance(default, np.ndarray)):
+        if isinstance(default, (tuple, np.ndarray)):
             nums = [float(v) for v in vals if isinstance(v, (int, float))]
             return tuple(nums[:len(default)]) if len(nums) >= len(default) else default
         v = vals[0]
@@ -87,13 +87,16 @@ def _properties(rec: Record) -> dict:
 
 def read(data: bytes, base_dir: str | os.PathLike | None = None) -> Scene:
     """Parse FBX bytes into a Scene. base_dir is where to look for external textures."""
-    version, records = parse(data)
-    top = {}
-    for r in records:
-        top.setdefault(r.name, r)
-    if "Objects" not in top:
-        raise MeshportError("This FBX file has no objects in it")
-    return _Reader(version, top, Path(base_dir) if base_dir else None).scene()
+    try:
+        version, records = parse(data)
+        top = {}
+        for r in records:
+            top.setdefault(r.name, r)
+        if "Objects" not in top:
+            raise MeshportError("This FBX file has no objects in it")
+        return _Reader(version, top, Path(base_dir) if base_dir else None).scene()
+    except DAMAGED as e:
+        raise MeshportError(f"This FBX file is damaged ({type(e).__name__}: {e})") from None
 
 
 def read_file(path: str | os.PathLike) -> Scene:

@@ -136,8 +136,8 @@ def _read_record(data: bytes, pos: int, layout: _Layout):
             pos += layout.array_head.size
             raw = data[pos:pos + size]
             pos += size
-            if encoding == 1:
-                raw = zlib.decompress(raw)
+            if encoding == 1:  # never inflate past the declared size: a tiny file can't claim gigabytes
+                raw = zlib.decompressobj().decompress(raw, n * layout.array[t].itemsize)
             arr = np.frombuffer(raw, dtype=layout.array[t], count=n)
             props.append(arr.astype(bool) if t == ord("b") else arr)
         elif t in (ord("S"), ord("R")):

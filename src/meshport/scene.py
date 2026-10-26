@@ -19,6 +19,12 @@ class MeshportError(Exception):
     """A file meshport can't read or write. The message is meant for end users."""
 
 
+# What a damaged or hostile file can make the parsers raise. Readers turn these into
+# MeshportError, so callers only ever have to catch one thing.
+DAMAGED = (ValueError, KeyError, IndexError, TypeError, AttributeError, OverflowError, RecursionError,
+           MemoryError)
+
+
 @dataclass(eq=False)
 class Image:
     name: str

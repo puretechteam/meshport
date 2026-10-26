@@ -20,7 +20,7 @@ import numpy as np
 
 from . import __version__
 from .geometry import scaling, translation, unique_rows
-from .scene import Image, Material, Mesh, MeshportError, Node, Scene
+from .scene import DAMAGED, Image, Material, Mesh, MeshportError, Node, Scene
 
 _GLB_MAGIC = b"glTF"
 _JSON_CHUNK, _BIN_CHUNK = 0x4E4F534A, 0x004E4942
@@ -33,15 +33,20 @@ _UNSUPPORTED = {"KHR_draco_mesh_compression": "Draco", "EXT_meshopt_compression"
 
 
 def read(data: bytes, base_dir: str | os.PathLike | None = None) -> Scene:
-    if data[:4] == _GLB_MAGIC:
-        doc, binary = _split_glb(data)
-    else:
-        try:
-            doc = json.loads(data.decode("utf-8-sig"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            raise MeshportError("This isn't a glTF file") from None
-        binary = None
-    return _Reader(doc, binary, Path(base_dir) if base_dir else None).scene()
+    try:
+        if data[:4] == _GLB_MAGIC:
+            doc, binary = _split_glb(data)
+        else:
+            try:
+                doc = json.loads(data.decode("utf-8-sig"))
+            except ValueError:  # bad UTF-8 or bad JSON
+                raise MeshportError("This isn't a glTF file") from None
+            binary = None
+        if not isinstance(doc, dict):
+            raise MeshportError("This isn't a glTF file")
+        return _Reader(doc, binary, Path(base_dir) if base_dir else None).scene()
+    except (*DAMAGED, struct.error) as e:
+        raise MeshportError(f"This glTF file is damaged ({type(e).__name__}: {e})") from None
 
 
 def read_file(path: str | os.PathLike) -> Scene:
