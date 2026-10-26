@@ -65,6 +65,29 @@ python benchmarks/compare_readers.py path/to/your/fbx/files
 
 The asset-pack files themselves aren't included here because of their licenses.
 
+## Where it came from
+
+meshport was written for [ConvertAll](https://github.com/puretechteam/ConvertAll), a drag-and-drop file converter. ConvertAll used to need Blender for FBX:
+
+- Users had to install 963 MB of 3D software just to convert one format.
+- Every conversion waited about 2 seconds for Blender to start.
+- ASCII and FBX 6 files didn't open at all.
+
+With meshport, FBX is built into ConvertAll:
+
+- **Size:** the app grew by 74 KB.
+- **Speed:** all 12 conversions measured (three real models to GLB, STL, OBJ and 3MF, full app runs) got faster, by 1.6× to 4.9×.
+
+  | Model | Before (Blender) | After (meshport) |
+  |---|---|---|
+  | Car, 90 KB → GLB | 2.28 s | 0.46 s |
+  | Material ball, 1.5 MB → GLB | 2.35 s | 0.49 s |
+  | Nature scene, 7.8 MB → 3MF | 6.68 s | 2.73 s |
+
+- **Coverage:** files Blender couldn't open now convert.
+
+ConvertAll still uses Blender for `.blend`, USD and Alembic.
+
 ## What it does
 
 | Format | Read | Write |
