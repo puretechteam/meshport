@@ -10,6 +10,7 @@ Newest first. Each entry is dated by when it landed.
   - Names are cut to the format's limits (10 characters for objects, 16 for materials, 8.3 for texture files) and kept unique. `save()` writes the texture files next to the `.3ds`.
   - Skipped when reading: the keyframer section (animation and hierarchy), lights and cameras.
 - **Added:** 3DS tests: round trips, smoothing groups, splitting, name limits, damaged and hostile files, and Blender interop in both directions. Blender's 3DS add-on reads meshport's files with the same vertex and face counts and every vertex in place, and meshport reads Blender's 3DS files (keyframer section included) to the same geometry and smoothing as Blender's own glTF export. These skip when Blender or its `autodesk_3ds_format` extension isn't installed.
+- **Tested** on Assimp's 15 real-world `.3ds` sample files, mostly from 3ds Max. All read, and 13 match Blender's import vertex for vertex. The other 2 are animated, and meshport keeps the pose they were saved in, where Blender shows frame 0.
 - **Changed:** the FBX reader's texture search is now shared with the 3DS reader.
 - **Changed:** the code passes `ruff check` with ruff 0.16's wider default rules. No behavior changes.
 

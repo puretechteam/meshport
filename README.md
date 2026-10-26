@@ -147,6 +147,7 @@ Conventions are glTF's: right-handed, +Y up, 1 unit = 1 meter. UVs have v = 0 at
   - **2 Blender gets wrong:** both are copies of one model that uses geometric rotation, and Unity agrees with meshport.
 
   Where a file has back-to-back duplicate faces (two-sided walls), Blender deletes them and meshport keeps them.
+- **Real-world 3DS files.** Assimp's 15 sample `.3ds` files, mostly exported from 3ds Max, all read. 13 match Blender's import vertex for vertex. The other 2 are animated: meshport keeps the pose the file was saved in, and Blender shows the first frame of the animation. Each file also re-saves as 3DS, glTF and FBX with every triangle in place.
 - **Against ufbx and Assimp.** See [Why meshport?](#why-meshport) and `benchmarks/compare_readers.py`.
 - **The test suite** (`pytest`) builds its own files. It checks round trips, hand-written ASCII 6 and 7 files, every transform feature, glTF corner cases (interleaved buffers, sparse accessors, strips, external buffers), 3DS smoothing groups and mesh splitting, damaged and hostile files in every format and, when Blender is installed, both directions of Blender interop.
 
