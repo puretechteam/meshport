@@ -5,7 +5,7 @@ Read and write FBX, glTF and 3DS in pure Python. No FBX SDK, no 3D app, no compi
 What's new: see the [changelog](CHANGELOG.md).
 
 ```
-pip install meshport
+pip install git+https://github.com/puretechteam/meshport
 meshport character.fbx character.glb
 ```
 
@@ -61,7 +61,7 @@ Here is how they compare on the same **2,079 real-world FBX files** from game as
 To check these numbers on your own files:
 
 ```
-pip install meshport ufbx assimp-py
+pip install git+https://github.com/puretechteam/meshport ufbx assimp-py
 python benchmarks/compare_readers.py path/to/your/fbx/files
 ```
 
@@ -119,7 +119,9 @@ Not handled: animation, skinning, blend shapes, cameras and lights. Rigged chara
 
 When reading 3DS, the keyframer section supplies the hierarchy, pivots, dummy groups and instances. Animated files open at their first frame, as in Blender and Assimp. The animation itself, lights and cameras are skipped; a camera that other objects hang from is kept as an empty group.
 
-Textures that glTF can't hold (TGA, PSD, TIFF, ...) are re-encoded to PNG when [Pillow](https://pypi.org/project/Pillow/) is installed (`pip install meshport[images]`), and left out otherwise.
+Textures that glTF can't hold (TGA, PSD, TIFF, ...) are re-encoded to PNG when [Pillow](https://pypi.org/project/Pillow/) is installed (`pip install "meshport[images] @ git+https://github.com/puretechteam/meshport"`), and left out otherwise.
+
+Texture paths inside a model are followed carefully, since a model from the internet can name any file. Network paths (`\\server\share\...`) and URLs are never opened, and only files that really are images are taken. glTF files may only point to paths relative to themselves, and their buffers must sit in the model's own folder.
 
 ## The scene model
 

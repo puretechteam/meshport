@@ -10,6 +10,7 @@ corners. UV coordinates use the FBX/OpenGL convention: v = 0 at the bottom of th
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -126,6 +127,44 @@ class Scene:
                 lo.append(p.min(0))
                 hi.append(p.max(0))
         return np.array([np.min(lo, 0), np.max(hi, 0)]) if lo else None
+
+
+_MORE_IMAGE_MAGIC = (b"\x76\x2f\x31\x01", b"#?RADIANCE", b"#?RGBE", b"\xabKTX ", b"\x01\xda")  # EXR, HDR, KTX, SGI
+_BMP_INFO_SIZES = (12, 16, 40, 52, 56, 64, 108, 124)
+
+
+def looks_like_image(head: bytes, name: str = "") -> bool:
+    """Whether a file found on disk (its first 64 bytes or more) is an image. Model files name
+    their textures by path, so without this a hostile model could point at any file (a document,
+    a key) and have it copied into the converted output."""
+    if head.startswith(b"BM"):
+        return len(head) >= 18 and int.from_bytes(head[14:18], "little") in _BMP_INFO_SIZES
+    if sniff_mime(head) or head.startswith(_MORE_IMAGE_MAGIC):
+        return True
+    if head[4:8] == b"ftyp" and head[8:12] in (b"avif", b"avis", b"heic", b"heix", b"mif1"):
+        return True
+    # TGA has no signature: take the extension's word for it when the header is a valid one
+    return (name.lower().endswith(".tga") and len(head) >= 18 and head[1] in (0, 1)
+            and head[2] in (1, 2, 3, 9, 10, 11) and head[16] in (8, 15, 16, 24, 32))
+
+
+def is_remote_path(name: str) -> bool:
+    """A UNC path (\\\\server\\share\\...) or a URL. Merely checking whether one exists makes
+    Windows contact that server and offer it the user's login, so readers never touch them."""
+    name = name.replace("\\", "/")
+    return name.startswith("//") or "://" in name
+
+
+def read_image_file(path: str | os.PathLike) -> bytes | None:
+    """The file's bytes if it's an image, else None. Only the start of anything else is read."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+            if not looks_like_image(head, os.fspath(path)):
+                return None
+            return head + f.read()
+    except (OSError, ValueError):
+        return None
 
 
 def sniff_mime(data: bytes) -> str | None:

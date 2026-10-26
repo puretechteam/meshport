@@ -6,11 +6,13 @@ import zlib
 
 import numpy as np
 import pytest
+from conftest import nodes_by_name, png
 from test_3ds import _keyed_file, _kf_node, _mesh_object
 
 import meshport
 from meshport import MeshportError, fbx, max3ds
 from meshport.fbxtree import Record, write_ascii, write_binary
+from meshport.scene import is_remote_path
 
 
 def _keyed_3ds():
@@ -131,3 +133,100 @@ def test_3ds_many_smoothing_masks_stay_fast():
                      max3ds._chunk(max3ds.FACE_ARRAY, struct.pack("<H", n), tris.tobytes(),
                                    max3ds._chunk(max3ds.SMOOTH_GROUP, masks.tobytes())))
     assert meshport.read(data, "3ds").roots[0].mesh.normals.shape == (3 * n, 3)
+
+
+# ---- texture paths: a model names its textures by path, and a hostile one can name anything
+
+SECRET = b"not an image: private notes"
+
+
+def _with_texture(scene, path):
+    mat = nodes_by_name(scene)["box"][0].materials[0]
+    mat.base_color_texture = meshport.Image("tex", None, path)
+    return scene
+
+
+@pytest.mark.parametrize("how", ["absolute", "relative"])
+def test_texture_path_cant_pull_in_other_files(tmp_path, scene, how):
+    (tmp_path / "private").mkdir()
+    (tmp_path / "models").mkdir()
+    secret = tmp_path / "private" / "notes.txt"
+    secret.write_bytes(SECRET)
+    path = secret.as_posix() if how == "absolute" else "../private/notes.txt"
+    src = tmp_path / "models" / "box.fbx"
+    src.write_bytes(fbx.write(_with_texture(scene, path)))
+    back = meshport.load(src)
+    assert nodes_by_name(back)["box"][0].materials[0].base_color_texture.data is None
+    (tmp_path / "out").mkdir()
+    for ext in ("fbx", "3ds", "obj", "glb"):
+        for f in meshport.save(back, tmp_path / "out" / f"box.{ext}"):
+            assert SECRET not in f.read_bytes()
+
+
+def test_texture_at_an_absolute_path_still_loads(tmp_path, scene):
+    tex = tmp_path / "elsewhere" / "wood.png"
+    tex.parent.mkdir()
+    tex.write_bytes(png())
+    (tmp_path / "m").mkdir()
+    (tmp_path / "m" / "box.fbx").write_bytes(fbx.write(_with_texture(scene, str(tex))))
+    back = meshport.load(tmp_path / "m" / "box.fbx")
+    assert nodes_by_name(back)["box"][0].materials[0].base_color_texture.data == png()
+
+
+def test_network_texture_paths_are_never_opened(tmp_path, scene, monkeypatch):
+    opened = []
+    real = fbx.read_image_file
+    monkeypatch.setattr(fbx, "read_image_file", lambda p: opened.append(str(p)) or real(p))
+    (tmp_path / "box.fbx").write_bytes(fbx.write(_with_texture(scene, r"\\attacker.example\share\wood.png")))
+    meshport.load(tmp_path / "box.fbx")
+    assert opened and not any(p.replace("\\", "/").startswith("//") for p in opened)
+    assert is_remote_path(r"\\server\share\a.png") and is_remote_path("//server/a.png")
+    assert is_remote_path("https://example.com/a.png") and not is_remote_path("C:/textures/a.png")
+
+
+def _gltf_with(image_uri=None, buffer_uri="data.bin"):
+    images = {"materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}],
+              "textures": [{"source": 0}], "images": [{"uri": image_uri}]} if image_uri else {}
+    prim = {"attributes": {"POSITION": 0}, **({"material": 0} if image_uri else {})}
+    return {"asset": {"version": "2.0"}, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
+            "meshes": [{"primitives": [prim]}], "buffers": [{"byteLength": 36, "uri": buffer_uri}],
+            "bufferViews": [{"buffer": 0, "byteLength": 36}],
+            "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"}], **images}
+
+
+def _gltf_folder(tmp_path, doc):
+    import json
+    (tmp_path / "private").mkdir(exist_ok=True)
+    (tmp_path / "private" / "notes.txt").write_bytes(SECRET)
+    (tmp_path / "model").mkdir(exist_ok=True)
+    (tmp_path / "model" / "data.bin").write_bytes(np.eye(3, dtype=np.float32).tobytes())
+    (tmp_path / "model" / "m.gltf").write_text(json.dumps(doc))
+    return tmp_path / "model" / "m.gltf"
+
+
+@pytest.mark.parametrize("uri", ["../private/notes.txt", "ABSOLUTE", "file:///C:/Windows/win.ini",
+                                 "//attacker.example/share/a.png"])
+def test_gltf_image_uri_cant_pull_in_other_files(tmp_path, uri):
+    if uri == "ABSOLUTE":
+        uri = (tmp_path / "private" / "notes.txt").as_posix()
+    scene = meshport.load(_gltf_folder(tmp_path, _gltf_with(uri)))
+    assert scene.roots[0].materials[0].base_color_texture.data is None
+
+
+def test_gltf_buffer_must_stay_in_its_folder(tmp_path):
+    (tmp_path / "outside.bin").write_bytes(np.eye(3, dtype=np.float32).tobytes())
+    with pytest.raises(MeshportError, match="outside its folder"):
+        meshport.load(_gltf_folder(tmp_path, _gltf_with(buffer_uri="../outside.bin")))
+    with pytest.raises(MeshportError, match="relative"):
+        meshport.load(_gltf_folder(tmp_path, _gltf_with(buffer_uri=(tmp_path / "outside.bin").as_posix())))
+
+
+def test_gltf_tga_texture_file_is_accepted(tmp_path):
+    import io
+
+    from PIL import Image as PILImage
+    out = io.BytesIO()
+    PILImage.new("RGB", (4, 4), (0, 0, 255)).save(out, "TGA")
+    path = _gltf_folder(tmp_path, _gltf_with("wood.tga"))
+    (path.parent / "wood.tga").write_bytes(out.getvalue())
+    assert meshport.load(path).roots[0].materials[0].base_color_texture.data == out.getvalue()

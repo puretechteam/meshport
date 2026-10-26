@@ -20,7 +20,16 @@ import numpy as np
 
 from . import __version__
 from .geometry import scaling, translation, unique_rows
-from .scene import DAMAGED, Image, Material, Mesh, MeshportError, Node, Scene
+from .scene import (
+    DAMAGED,
+    Image,
+    Material,
+    Mesh,
+    MeshportError,
+    Node,
+    Scene,
+    read_image_file,
+)
 
 _GLB_MAGIC = b"glTF"
 _JSON_CHUNK, _BIN_CHUNK = 0x4E4F534A, 0x004E4942
@@ -92,14 +101,27 @@ class _Reader:
     def _list(self, key):
         return self.doc.get(key, [])
 
-    def _uri(self, uri: str) -> bytes:
+    def _uri(self, uri: str, image: bool = False) -> bytes:
+        """A buffer or image the file points to. Only relative paths are followed: buffers must
+        be in the model's folder, and images anywhere relative to it but actually images. So a
+        hostile file can't copy other files on the computer into the output."""
         if uri.startswith("data:"):
             return base64.b64decode(uri.split(",", 1)[1])
         if self.base_dir is None:
             raise MeshportError(f"This glTF file needs {uri}, which wasn't given")
-        path = self.base_dir / unquote(uri)
+        rel = unquote(uri)
+        if ":" in rel or rel.replace("\\", "/").startswith("/"):
+            raise MeshportError(f"This glTF file points to {rel}; meshport only follows paths relative to it")
+        path = self.base_dir / rel
         if not path.is_file():
-            raise MeshportError(f"This glTF file needs {unquote(uri)} next to it, and it's missing")
+            raise MeshportError(f"This glTF file needs {rel} next to it, and it's missing")
+        if image:
+            data = read_image_file(path)
+            if data is None:
+                raise MeshportError(f"{rel} isn't an image")
+            return data
+        if not path.resolve().is_relative_to(self.base_dir.resolve()):
+            raise MeshportError(f"This glTF file's buffer {rel} is outside its folder")
         return path.read_bytes()
 
     def _buffer(self, i: int) -> bytes:
@@ -248,7 +270,7 @@ class _Reader:
                     data = bytes(buf[off:off + length])
                     path = None
                 else:
-                    data = self._uri(img["uri"])
+                    data = self._uri(img["uri"], image=True)
                     path = None if img["uri"].startswith("data:") else unquote(img["uri"])
                 self._images[source] = Image(name, data, path)
             except MeshportError:

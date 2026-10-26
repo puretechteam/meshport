@@ -20,7 +20,7 @@ classifiers = [
 
 [project.optional-dependencies]
 images = ["Pillow>=10"]  # re-encode TGA/TIFF/PSD/... textures to PNG for glTF
-dev = ["pytest>=8", "Pillow>=10", "trimesh>=4"]
+dev = ["pytest>=8", "Pillow>=10", "trimesh>=4", "ruff>=0.16,<0.17"]
 
 [project.scripts]
 meshport = "meshport.__main__:main"

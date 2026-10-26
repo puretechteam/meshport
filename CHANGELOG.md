@@ -2,6 +2,16 @@
 
 Newest first. Each entry is dated by when it landed.
 
+## 2026-10-26: Texture paths can't reach other files (part of 0.2.0)
+
+- **Fixed (security):** a model's texture paths could name any file on the computer, and meshport would copy it into the FBX, 3DS or OBJ it wrote. A hostile model from the internet could use this to slip private files into a converted copy that then gets shared. Now:
+  - only files that really are images (PNG, JPEG, TGA, BMP, TIFF, DDS, PSD, GIF, WebP, EXR, HDR, KTX, AVIF/HEIF, SGI) are taken, and only the first 64 bytes of anything else are read;
+  - network paths (`\\server\share\...`) and URLs are never opened. On Windows, even checking whether one exists sends the user's login to that server;
+  - glTF files may only point to paths relative to themselves, and their buffers must sit in the model's own folder.
+- **Added:** tests for all of the above (`tests/test_damaged.py`).
+- **Changed:** the README's install lines use the GitHub URL, since meshport isn't on PyPI yet.
+- **Added:** GitHub Actions run the tests (Python 3.10 and 3.13 on Windows) and `ruff check` on every push and pull request, plus `CONTRIBUTING.md` and `SECURITY.md`. `ruff` is in the `dev` extra.
+
 ## 2026-10-25: meshport 0.2.0, Autodesk 3DS
 
 - **Added:** reading and writing `.3ds` files (`meshport.load`/`save`, `meshport.read`/`write` with `"3ds"`, and the command line).

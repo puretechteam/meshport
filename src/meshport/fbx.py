@@ -31,7 +31,17 @@ from .geometry import (
     translation,
     unique_rows,
 )
-from .scene import DAMAGED, Image, Material, Mesh, MeshportError, Node, Scene
+from .scene import (
+    DAMAGED,
+    Image,
+    Material,
+    Mesh,
+    MeshportError,
+    Node,
+    Scene,
+    is_remote_path,
+    read_image_file,
+)
 
 # ============================================================================ reading
 
@@ -485,28 +495,31 @@ class TextureFinder:
         """Texture paths in model files usually point at the artist's own drive. Try the path
         as written, then the file name next to the model, in texture folders up to two
         levels above it (Pack/Models/x.fbx -> Pack/Textures/), and finally anywhere under
-        the folder above the model."""
+        the folder above the model. Network paths are never opened, and only image files
+        are taken, so a model can't pull other files into the output."""
         bases = []
         candidates = []
         for n in names:
             n = n.replace("\\", "/")
             p = Path(n)
             bases.append(p.name.lower())
+            if is_remote_path(n):
+                continue
             if self.base_dir is not None and not p.is_absolute() and ":" not in n:
                 candidates.append(self.base_dir / n)
             candidates.append(p)
         for c in candidates:
-            try:
-                if c.is_file():
-                    return c.read_bytes()
-            except OSError:
-                continue
+            data = read_image_file(c)
+            if data is not None:
+                return data
         if self.base_dir is None:
             return None
         listing = self._listing()
         for base in bases:
             if base in listing:
-                return listing[base].read_bytes()
+                data = read_image_file(listing[base])
+                if data is not None:
+                    return data
         return None
 
     def _listing(self) -> dict[str, Path]:
