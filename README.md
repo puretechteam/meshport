@@ -21,6 +21,7 @@ meshport.save(scene, "character.glb")
 | FBX binary, 6.x and 7.x (2006 onward, either byte order) | ✓ | ✓ (7.4, the version every importer accepts) |
 | FBX ASCII, 6.x and 7.x | ✓ | – |
 | glTF 2.0 (`.gltf`, `.glb`) | ✓ | ✓ (everything embedded in one file) |
+| Wavefront OBJ | – | ✓ (with .mtl and texture files) |
 
 What comes across in both directions:
 
@@ -77,6 +78,7 @@ Code layout:
 - `src/meshport/fbxtree.py`: FBX as a raw record tree (binary and ASCII parsing, binary writing).
 - `src/meshport/fbx.py`: the record tree ↔ `Scene`.
 - `src/meshport/gltf.py`: glTF ↔ `Scene`.
+- `src/meshport/obj.py`: `Scene` → OBJ.
 - `src/meshport/geometry.py`: transforms and triangulation.
 
 ## License

@@ -16,7 +16,7 @@ __version__ = "0.1.0"
 
 from .scene import Image, Material, Mesh, MeshportError, Node, Scene  # noqa: E402
 
-FORMATS = {"fbx": "FBX", "glb": "glTF binary", "gltf": "glTF"}
+FORMATS = {"fbx": "FBX", "glb": "glTF binary", "gltf": "glTF", "obj": "Wavefront OBJ (write only)"}
 
 __all__ = ["FORMATS", "Image", "Material", "Mesh", "MeshportError", "Node", "Scene", "load", "save",
            "read", "write", "__version__"]
@@ -56,6 +56,8 @@ def read(data: bytes, fmt: str | None = None, base_dir: str | os.PathLike | None
 
 def write(scene: Scene, fmt: str) -> bytes:
     fmt = fmt.lower().lstrip(".")
+    if fmt == "obj":
+        raise MeshportError("OBJ is a set of files (.obj, .mtl, textures): write it with save()")
     mod = _module(fmt)
     return mod.write(scene, binary=fmt == "glb") if fmt in ("glb", "gltf") else mod.write(scene)
 
@@ -67,7 +69,13 @@ def load(path: str | os.PathLike, fmt: str | None = None) -> Scene:
     return read(data, fmt or _sniff(data) or path.suffix, path.parent)
 
 
-def save(scene: Scene, path: str | os.PathLike, fmt: str | None = None) -> None:
-    """Write a file; the format comes from the extension unless given."""
+def save(scene: Scene, path: str | os.PathLike, fmt: str | None = None) -> list[Path]:
+    """Write a file; the format comes from the extension unless given. Returns every file
+    written (OBJ also writes a .mtl and textures next to it)."""
     path = Path(path)
-    path.write_bytes(write(scene, fmt or path.suffix))
+    fmt = (fmt or path.suffix).lower().lstrip(".")
+    if fmt == "obj":
+        from . import obj
+        return obj.write_file(scene, path)
+    path.write_bytes(write(scene, fmt))
+    return [path]
