@@ -42,6 +42,7 @@ COLOR_F, COLOR_24, LIN_COLOR_24, LIN_COLOR_F = 0x0010, 0x0011, 0x0012, 0x0013
 INT_PERCENTAGE, FLOAT_PERCENTAGE = 0x0030, 0x0031
 CAMERA_OBJECT = 0x4700
 KFDATA, AMBIENT_NODE, OBJECT_NODE, CAMERA_NODE, TARGET_NODE, SPOT_NODE = 0xB000, 0xB001, 0xB002, 0xB003, 0xB004, 0xB007
+KF_SEGMENT, KF_CURRENT = 0xB008, 0xB009
 NODE_HDR, INSTANCE_NAME, PIVOT, NODE_ID = 0xB010, 0xB011, 0xB013, 0xB030
 POS_TRACK, ROT_TRACK, SCL_TRACK, ROLL_TRACK = 0xB020, 0xB021, 0xB022, 0xB024
 DUMMY = "$$$DUMMY"  # the object name of a keyframer node that only groups others
@@ -112,6 +113,8 @@ class _Reader:
         self.materials: dict[str, Material] = {}
         self.images: dict[str, Image | None] = {}
         self.cameras: dict[str, tuple] = {}  # name -> (position, target, roll in degrees)
+        self.segment_start: int | None = None
+        self.saved_frame: int | None = None  # the frame the file was saved on, in ticks
 
     def scene(self) -> Scene:
         data = self.data
@@ -131,7 +134,9 @@ class _Reader:
                     objects.setdefault(name, nodes)
                     loose += nodes
         keys = [k for cid, s, e in _chunks(data, 6, end) if cid == KFDATA for k in self._keyframer(s, e)]
-        scene = Scene(self._hierarchy(keys, objects, loose) if keys else loose)
+        # Saved on the first frame, the stored geometry already is the first-frame pose, exactly.
+        exact = self.saved_frame is not None and self.saved_frame in (self.segment_start, 160 * self.segment_start)
+        scene = Scene(self._hierarchy(keys, objects, loose, exact) if keys else loose)
         if not scene.meshes:
             raise MeshportError("No 3D geometry found in this file")
         return scene
@@ -162,6 +167,10 @@ class _Reader:
         data = self.data
         out = []
         for cid, s, e in _chunks(data, start, end):
+            if cid == KF_SEGMENT and e - s >= 8:
+                self.segment_start = struct.unpack_from("<I", data, s)[0]
+            elif cid == KF_CURRENT and e - s >= 4:
+                self.saved_frame = struct.unpack_from("<I", data, s)[0]  # 160 ticks a frame
             if not AMBIENT_NODE <= cid <= SPOT_NODE:  # ambient, object, camera, target, lights
                 continue
             kind = {OBJECT_NODE: "object", CAMERA_NODE: "camera", TARGET_NODE: "target"}.get(cid, "other")
@@ -201,11 +210,13 @@ class _Reader:
         value = struct.unpack_from(f"<{width}f", data, pos)
         return value if all(np.isfinite(value)) else None
 
-    def _hierarchy(self, keys: list[dict], objects: dict[str, list[Node]], loose: list[Node]) -> list[Node]:
+    def _hierarchy(self, keys: list[dict], objects: dict[str, list[Node]], loose: list[Node],
+                   exact: bool) -> list[Node]:
         """Nodes placed by the keyframer at its first frame, parented, plus any object it
-        doesn't mention. A node hanging from something meshport can't place (a light, a
-        missing node) keeps the pose it was saved in."""
-        saved = {id(n): np.linalg.inv(_Z_UP) @ n.matrix for n in loose}
+        doesn't mention. With exact, or when a node hangs from something meshport can't
+        place (a light, a missing node), an object keeps the pose it was saved in."""
+        saved = {id(n): n.matrix.copy() for n in loose}  # world, Y up
+        keep: dict[int, np.ndarray] = {}  # node -> the world matrix it keeps
         targets = {k["name"]: k[POS_TRACK] for k in keys if k["kind"] == "target" and k[POS_TRACK]}
         placeable = {k["id"] for k in keys if k["kind"] in ("object", "camera")}
         placed: list[tuple[Node, int]] = []
@@ -236,9 +247,14 @@ class _Reader:
                 for part in parts:
                     part.matrix = np.eye(4)
             parent_id = key["parent"]
-            if parent_id >= 0 and parent_id not in placeable and sources:
-                node.matrix = saved[id(sources[0])].copy()
+            if parent_id >= 0 and parent_id not in placeable:
                 parent_id = -1
+                if sources:
+                    keep[id(node)] = saved[id(sources[0])]
+            elif exact and id(node) in saved:
+                keep[id(node)] = saved[id(node)]
+            if id(node) in keep:
+                node.matrix = _key_matrix(key)  # for now: replaced below, once its parent is placed
             else:
                 # The mesh is kept relative to its own matrix; the node moves it from its pivot.
                 if any(key["pivot"]):
@@ -266,6 +282,15 @@ class _Reader:
                 parent_of[id(node)] = parent
         for node in roots:
             node.matrix = _Z_UP @ node.matrix
+
+        def settle(node: Node, parent_world: np.ndarray):
+            if id(node) in keep and abs(np.linalg.det(parent_world)) > 1e-12:
+                node.matrix = np.linalg.inv(parent_world) @ keep[id(node)]
+            for child in node.children:
+                settle(child, parent_world @ node.matrix)
+
+        for node in roots:
+            settle(node, np.eye(4))
         roots = [n for n in roots if id(n) not in cameras or n.children]  # cameras only stay as parents
         for node, _ in Scene(roots).walk():
             node.children = [c for c in node.children if id(c) not in cameras or c.children]
@@ -365,13 +390,15 @@ class _Reader:
             mat.alpha_mode = "BLEND"
         if self_illum > 0:
             mat.emissive = tuple(float(min(c * self_illum, 1.0)) for c in diffuse)
+        # A texture that was found replaces the color under it; a missing one leaves the color.
         if maps.get(MAT_TEXMAP):
             mat.base_color_texture = maps[MAT_TEXMAP]
-            mat.base_color = (1.0, 1.0, 1.0, alpha)
+            if mat.base_color_texture.data:
+                mat.base_color = (1.0, 1.0, 1.0, alpha)
         mat.normal_texture = maps.get(MAT_BUMPMAP)
         if maps.get(MAT_SELFIMAP):
             mat.emissive_texture = maps[MAT_SELFIMAP]
-            if not any(mat.emissive):
+            if not any(mat.emissive) and mat.emissive_texture.data:
                 mat.emissive = (1.0, 1.0, 1.0)
         return mat
 
@@ -457,13 +484,20 @@ def _smooth_normals(positions: np.ndarray, tris: np.ndarray, groups: np.ndarray)
     """Per-corner normals from smoothing groups: a corner averages the faces around its
     vertex that share a group bit with its own face; faces in no group stay flat."""
     p = positions[tris]
-    face_n = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])  # area-weighted
+    face_n = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
+    length = np.linalg.norm(face_n, axis=1, keepdims=True)
+    face_n = np.divide(face_n, length, out=np.zeros_like(face_n), where=length > 0)
+    # Each face counts by its angle at the corner, as in Blender.
+    edge_a, edge_b = np.roll(p, -1, axis=1) - p, np.roll(p, 1, axis=1) - p
+    cos = np.einsum("fki,fki->fk", edge_a, edge_b) / np.maximum(
+        np.linalg.norm(edge_a, axis=2) * np.linalg.norm(edge_b, axis=2), 1e-300)
+    weighted = face_n[:, None, :] * np.arccos(np.clip(cos, -1.0, 1.0))[:, :, None]  # (F, 3 corners, 3)
     out = np.repeat(face_n, 3, axis=0).reshape(-1, 3, 3)
     masks = np.unique(groups[groups != 0])
 
     def around(faces: np.ndarray) -> np.ndarray:
-        """Per vertex: the sum of these faces' normals."""
-        idx, w = tris[faces].ravel(), np.repeat(face_n[faces], 3, axis=0)
+        """Per vertex: the angle-weighted sum of these faces' normals."""
+        idx, w = tris[faces].ravel(), weighted[faces].reshape(-1, 3)
         return np.stack([np.bincount(idx, w[:, k], len(positions)) for k in range(3)], 1)
 
     if len(masks) <= 64:  # exact: each distinct mask gathers every face it shares a bit with
@@ -578,14 +612,16 @@ class _Writer:
         if np.linalg.det(world[:3, :3]) < 0:  # mirrored: the points go out in world space, so flip
             tris = tris[:, ::-1]
         corner = tris.ravel()
-        # One 3DS vertex per distinct (position, uv, normal): 3DS has one UV per vertex, and
+        # One 3DS vertex per distinct (vertex, uv, normal): 3DS has one UV per vertex, and
         # splitting where normals change keeps hard edges hard under a single smoothing group.
+        # Vertices the mesh keeps apart stay apart, even where they sit at the same spot.
         columns = [transform_points(matrix, mesh.positions)[mesh.corners[corner]]]
         if mesh.uvs:
             columns.append(mesh.uvs[0][corner])
         if mesh.normals is not None:
             columns.append(mesh.normals[corner])
-        table = np.hstack(columns).astype(np.float32)
+        source = mesh.corners[corner].astype(np.int32).view(np.float32)[:, None]  # compared by its bits
+        table = np.hstack([np.hstack(columns).astype(np.float32), source])
         first, inverse = unique_rows(table)
         vertices = table[first]
         index = inverse.reshape(-1, 3)

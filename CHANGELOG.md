@@ -11,7 +11,12 @@ Newest first. Each entry is dated by when it landed.
   - Reads the keyframer section for the hierarchy, pivots, dummy groups, instances and objects parented to cameras. Animated files open at their first frame, as in Blender and Assimp.
   - Skipped when reading: the animation itself, lights and cameras.
 - **Added:** 3DS tests: round trips, smoothing groups, splitting, name limits, damaged and hostile files, and Blender interop in both directions. Blender's 3DS add-on reads meshport's files with the same vertex and face counts and every vertex in place, and meshport reads Blender's 3DS files (keyframer section included) to the same geometry and smoothing as Blender's own glTF export. These skip when Blender or its `autodesk_3ds_format` extension isn't installed.
-- **Tested** on Assimp's 15 real-world `.3ds` sample files, mostly from 3ds Max. All read, and 14 match Blender's import vertex for vertex. The 15th has a box hanging from an animated camera: meshport puts it where the file's stored geometry says 3ds Max had it on frame 0, and Blender puts it 41 units away. Every file saved on frame 0 comes out exactly as its stored geometry.
+- **Tested** on Assimp's 15 real-world `.3ds` sample files, mostly from 3ds Max. Positions, UVs, material colors, opacity and textures match Blender's import. Files saved on their first frame come out exactly as their stored geometry. Normals match a literal implementation of the smoothing-group rule; where Blender differs, its importer adds rules of its own. Blender reads meshport's re-saved copies with the same counts and positions. `tests/test_corpus_3ds.py` reruns these checks on any folder named by `MESHPORT_3DS_CORPUS`.
+- **Fixed while testing on those files:**
+  - Smoothing-group normals weight each face by its angle at the corner, as Blender does, instead of by its area.
+  - A material whose texture file is missing keeps its own color instead of turning white.
+  - The writer no longer merges vertices that the mesh keeps apart at the same spot. Merging them turned zero-area faces into faces other programs delete.
+  - A file saved on its first frame takes object placement from its stored geometry, which is exact, and still takes the hierarchy from the keyframer.
 - **Changed:** the FBX reader's texture search is now shared with the 3DS reader.
 - **Changed:** the code passes `ruff check` with ruff 0.16's wider default rules. No behavior changes.
 

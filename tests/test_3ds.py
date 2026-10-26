@@ -324,3 +324,40 @@ def test_keyframer_loops_are_cut():
     nodes = [_kf_node("a", 0, parent=1, pos=(0, 0, 0)), _kf_node("b", 1, parent=0, pos=(0, 0, 0))]
     scene = max3ds.read(_keyed_file(objects, nodes))
     assert sum(1 for _ in scene.walk()) == 2
+
+
+def test_keyframer_saved_on_the_first_frame_keeps_the_stored_pose():
+    # The keys say one thing, but the file was saved on frame 0, so its stored geometry
+    # already is the frame-0 pose (3ds Max shows what's stored if an object was moved
+    # without a key). The hierarchy still comes from the keyframer.
+    arm, hand = compose((1, 2, 3)), compose((4, 5, 6))
+    data = _keyed_file([_mesh_object("arm", arm), _mesh_object("hand", hand)],
+                       [_chunk(max3ds.KF_SEGMENT, struct.pack("<II", 0, 100)),
+                        _chunk(max3ds.KF_CURRENT, struct.pack("<I", 0)),
+                        _kf_node("arm", 0, pos=(9, 9, 9), pivot=(1, 1, 1)), _kf_node("hand", 1, parent=0, pos=(7, 7, 7))])
+    scene = max3ds.read(data)
+    assert [c.name for c in scene.roots[0].children] == ["hand"]
+    points = _world_points(scene)
+    np.testing.assert_allclose(points["arm"], _TRI + (1, 2, 3), atol=1e-6)
+    np.testing.assert_allclose(points["hand"], _TRI + (4, 5, 6), atol=1e-6)
+
+
+def test_a_missing_texture_leaves_the_color(tmp_path):
+    found = Material("found", (0.2, 0.4, 0.6, 1), Image("ok", png()))
+    missing = Material("missing", (0.2, 0.4, 0.6, 1), Image("gone", None, "gone.png"))
+    mesh = Mesh("m", np.eye(3), np.array([3, 3]), np.array([0, 1, 2, 0, 2, 1]), face_materials=np.array([0, 1]))
+    meshport.save(Scene([Node("n", mesh=mesh, materials=[found, missing])]), tmp_path / "m.3ds")
+    mats = {m.name: m for m in meshport.load(tmp_path / "m.3ds").roots[0].materials}
+    assert mats["found"].base_color_texture.data == png()
+    assert mats["found"].base_color[:3] == (1, 1, 1)  # the texture is the color
+    assert mats["missing"].base_color_texture.data is None
+    assert mats["missing"].base_color[:3] == pytest.approx((0.2, 0.4, 0.6))  # not white
+
+
+def test_vertices_at_the_same_spot_stay_apart():
+    # Two triangles touching at a point that the mesh keeps as two vertices (a zero-area
+    # sliver in real files): merging them would change the faces other programs see.
+    p = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 0], [-1, 0, 0], [0, -1, 0]], float)
+    mesh = Mesh("m", p, np.array([3, 3]), np.arange(6))
+    back = max3ds.read(max3ds.write(Scene([Node("m", mesh=mesh)]))).roots[0].mesh
+    assert len(back.positions) == 6

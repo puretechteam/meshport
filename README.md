@@ -147,7 +147,12 @@ Conventions are glTF's: right-handed, +Y up, 1 unit = 1 meter. UVs have v = 0 at
   - **2 Blender gets wrong:** both are copies of one model that uses geometric rotation, and Unity agrees with meshport.
 
   Where a file has back-to-back duplicate faces (two-sided walls), Blender deletes them and meshport keeps them.
-- **Real-world 3DS files.** Assimp's 15 sample `.3ds` files, mostly exported from 3ds Max, all read. 14 match Blender's import vertex for vertex. In the 15th, a box hangs from an animated camera. That file was saved on frame 0, so its stored geometry shows where 3ds Max had the box, and meshport puts it there; Blender's camera handling puts it 41 units away. Every file saved on frame 0 comes out exactly as its stored geometry. Each file also re-saves as 3DS, glTF and FBX with every triangle in place.
+- **Real-world 3DS files.** Assimp's 15 sample `.3ds` files, mostly exported from 3ds Max, plus one with no file extension:
+  - All read. Positions, UVs, material colors, opacity and textures match Blender's import on every file, except one object described below.
+  - Every file saved on its first frame comes out exactly as its stored geometry, hierarchy included. One of them has a box hanging from an animated camera, and Blender's camera handling puts that box 41 units from where the file has it.
+  - Normals follow the smoothing groups exactly, checked against a literal implementation of the rule. Blender's normals differ on some files because its importer adds rules of its own: it only sharpens edges flagged visible, and then sharpens every edge of such a face. An emulation of Blender's rule reproduces its normals on those files.
+  - Each file re-saves as 3DS, glTF and FBX with every triangle in place. Blender reads meshport's re-saved 3DS files with the same objects, vertices and faces as the originals, and the same positions.
+  - To rerun these checks on your own files: `MESHPORT_3DS_CORPUS=path/to/folder pytest tests/test_corpus_3ds.py`.
 - **Against ufbx and Assimp.** See [Why meshport?](#why-meshport) and `benchmarks/compare_readers.py`.
 - **The test suite** (`pytest`) builds its own files. It checks round trips, hand-written ASCII 6 and 7 files, every transform feature, glTF corner cases (interleaved buffers, sparse accessors, strips, external buffers), 3DS smoothing groups and mesh splitting, damaged and hostile files in every format and, when Blender is installed, both directions of Blender interop.
 
