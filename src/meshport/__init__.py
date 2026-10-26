@@ -14,12 +14,12 @@ from pathlib import Path
 
 __version__ = "0.1.0"
 
-from .scene import Image, Material, Mesh, MeshportError, Node, Scene  # noqa: E402
+from .scene import Image, Material, Mesh, MeshportError, Node, Scene
 
 FORMATS = {"fbx": "FBX", "glb": "glTF binary", "gltf": "glTF", "obj": "Wavefront OBJ (write only)"}
 
-__all__ = ["FORMATS", "Image", "Material", "Mesh", "MeshportError", "Node", "Scene", "load", "save",
-           "read", "write", "__version__"]
+__all__ = ["FORMATS", "Image", "Material", "Mesh", "MeshportError", "Node", "Scene", "__version__", "load",
+           "read", "save", "write"]
 
 
 def _module(fmt: str):

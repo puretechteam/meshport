@@ -122,7 +122,7 @@ class _Reader:
         dtype = np.dtype(_COMPONENT[acc["componentType"]])
         width, count = _WIDTH[acc["type"]], acc["count"]
         if "bufferView" in acc:
-            buf, offset, length, stride = self._view(acc["bufferView"])
+            buf, offset, _, stride = self._view(acc["bufferView"])
             offset += acc.get("byteOffset", 0)
             item = dtype.itemsize * width
             if stride and stride != item:

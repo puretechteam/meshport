@@ -20,8 +20,17 @@ import numpy as np
 
 from . import __version__
 from .fbxtree import CREATION_TIME, FILE_ID, Record, decode_content, parse, write_binary
-from .geometry import (EULER_ORDERS, compose, decompose, euler, scaling, transform_normals, transform_points,
-                       translation, unique_rows)
+from .geometry import (
+    EULER_ORDERS,
+    compose,
+    decompose,
+    euler,
+    scaling,
+    transform_normals,
+    transform_points,
+    translation,
+    unique_rows,
+)
 from .scene import DAMAGED, Image, Material, Mesh, MeshportError, Node, Scene
 
 # ============================================================================ reading
@@ -348,7 +357,7 @@ class _Reader:
 
     @staticmethod
     def _layer_values(elem: Record, data_name, index_name, width, ctx) -> np.ndarray | None:
-        corners, face_of_corner, n_corners, n_faces, n_verts = ctx
+        corners, face_of_corner, n_corners, _, _ = ctx
         data = elem.array(data_name)
         if data is None or len(data) < width:
             return None
@@ -457,7 +466,7 @@ class _Reader:
         self.images[tex.id] = image
         return image
 
-    _TEXTURE_DIRS = {"texture", "textures", "tex", "materials", "images", "maps"}
+    _TEXTURE_DIRS = frozenset({"texture", "textures", "tex", "materials", "images", "maps"})
 
     def _find_file(self, names: list[str]) -> bytes | None:
         """Texture paths in FBX files usually point at the artist's own drive. Try the path
@@ -602,7 +611,7 @@ class _Writer:
         return f"meshport {__version__}"
 
     def _header(self) -> Record:
-        now = datetime.datetime.now()
+        now = datetime.datetime.now().astimezone()
         stamp = Record("CreationTimeStamp", children=[
             Record("Version", [1000]), Record("Year", [now.year]), Record("Month", [now.month]),
             Record("Day", [now.day]), Record("Hour", [now.hour]), Record("Minute", [now.minute]),

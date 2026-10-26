@@ -236,7 +236,7 @@ _TOKEN = re.compile(r"""
   | \*(?P<count>\d+)
   | (?P<open>\{) | (?P<close>\}) | (?P<comma>,)
   | (?P<word>[^\s,{}";]+)
-""", re.X)
+""", re.VERBOSE)
 _VALUES_END = re.compile(r"[{}]|\n[ \t]*[A-Za-z_][\w|.\-]*[ \t]*:")
 _NUMERIC = re.compile(r"[\s\d.,eE+\-]*")
 _INT = re.compile(r"[-+]?\d+")

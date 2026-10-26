@@ -45,7 +45,7 @@ def test_zip_bomb_array_is_not_inflated():
     name = b"Vertices"
     record = head.pack(27 + head.size + len(name) + len(body), 1, len(body), len(name)) + name + body
     data = header + record + bytes(head.size)
-    version, (back,) = meshport.fbxtree.parse(data)
+    _, (back,) = meshport.fbxtree.parse(data)
     np.testing.assert_array_equal(back.props[0], [0.0, 0.0, 0.0])  # only what was declared
 
 

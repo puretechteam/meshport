@@ -95,7 +95,7 @@ def run(folder: Path) -> None:
             continue
         out = work / f"{reader}.jsonl"
         for _ in range(len(files) + 1):  # one retry per crash at most
-            if subprocess.run([sys.executable, __file__, "--worker", reader, str(listing), str(out)]).returncode == 0:
+            if subprocess.run([sys.executable, __file__, "--worker", reader, str(listing), str(out)], check=False).returncode == 0:
                 break
         rows = {}
         for line in out.open(encoding="utf-8"):
