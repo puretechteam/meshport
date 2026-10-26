@@ -204,3 +204,123 @@ def test_textures_without_data_are_still_named():
     node = Node("n", mesh=Mesh("n", p, np.array([3]), np.arange(3)), materials=[mat])
     back = max3ds.read(max3ds.write(Scene([node])))
     assert back.roots[0].materials[0].base_color_texture.path == "Wood_Pla.tga"  # 8.3, what every reader takes
+
+
+# ---- the keyframer: hierarchy, pivots and the first frame of the animation
+
+_TRI = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], float)
+
+
+def _mesh_object(name: str, world: np.ndarray, local=_TRI) -> bytes:
+    """An object whose points are stored in world space, as 3DS keeps them."""
+    points = (local @ world[:3, :3].T + world[:3, 3]).astype("<f4")
+    faces = np.array([[0, 1, 2, 0]], "<u2")
+    rows = world[:3, :].T.astype("<f4")  # x axis, y axis, z axis, origin
+    return _chunk(max3ds.OBJECT, name.encode() + b"\0", _chunk(
+        max3ds.TRIMESH, _chunk(max3ds.POINT_ARRAY, struct.pack("<H", len(points)), points.tobytes()),
+        _chunk(max3ds.MESH_MATRIX, rows.tobytes()),
+        _chunk(max3ds.FACE_ARRAY, struct.pack("<H", 1), faces.tobytes())))
+
+
+def _track(cid: int, *value: float) -> bytes:
+    return _chunk(cid, struct.pack("<H8xI", 0, 1), struct.pack("<IH", 0, 0), struct.pack(f"<{len(value)}f", *value))
+
+
+def _kf_node(name: str, node_id: int, parent: int = -1, kind: int = max3ds.OBJECT_NODE, pos=None, rot=None,
+             scale=None, pivot=None, instance=None) -> bytes:
+    parts = [_chunk(max3ds.NODE_ID, struct.pack("<h", node_id)),
+             _chunk(max3ds.NODE_HDR, name.encode() + b"\0", struct.pack("<HHh", 0, 0, parent))]
+    if instance:
+        parts.append(_chunk(max3ds.INSTANCE_NAME, instance.encode() + b"\0"))
+    if pivot:
+        parts.append(_chunk(max3ds.PIVOT, struct.pack("<3f", *pivot)))
+    for cid, value in ((max3ds.POS_TRACK, pos), (max3ds.ROT_TRACK, rot), (max3ds.SCL_TRACK, scale)):
+        if value is not None:
+            parts.append(_track(cid, *value))
+    return _chunk(kind, *parts)
+
+
+def _keyed_file(objects: list[bytes], nodes: list[bytes]) -> bytes:
+    return _chunk(max3ds.MAIN, _chunk(max3ds.VERSION, struct.pack("<I", 3)), _chunk(max3ds.EDIT, *objects),
+                  _chunk(max3ds.KFDATA, *nodes))
+
+
+def _world_points(scene: Scene) -> dict[str, np.ndarray]:
+    """Each mesh's points in world space, back in 3DS's Z-up axes."""
+    out = {}
+    for node, world in scene.walk():
+        if node.mesh is not None:
+            p = node.mesh.positions @ world[:3, :3].T + world[:3, 3]
+            out[node.name] = p @ np.linalg.inv(max3ds._Z_UP[:3, :3]).T
+    return out
+
+
+def test_keyframer_poses_the_first_frame_with_parents_and_pivots():
+    # Saved later in the animation, so the stored points are somewhere else entirely.
+    saved = compose((50, 50, 50))
+    objects = [_mesh_object("arm", saved), _mesh_object("hand", saved @ compose((0, 0, 1)))]
+    nodes = [_kf_node("arm", 0, pos=(10, 0, 0), rot=(-np.pi / 2, 0, 0, 1), pivot=(1, 0, 0)),  # +90 degrees about Z
+             _kf_node("hand", 1, parent=0, pos=(0, 2, 0))]
+    scene = max3ds.read(_keyed_file(objects, nodes))
+    assert [n.name for n in scene.roots] == ["arm"] and [c.name for c in scene.roots[0].children] == ["hand"]
+    points = _world_points(scene)
+    # arm: its own points moved off the pivot, turned a quarter about Z, then placed at (10, 0, 0)
+    np.testing.assert_allclose(points["arm"], [[10, -1, 0], [10, 0, 0], [9, -1, 0]], atol=1e-6)
+    # hand: 2 along the arm's local Y, which the quarter turn points down -X
+    np.testing.assert_allclose(points["hand"], [[8, 0, 0], [8, 1, 0], [7, 0, 0]], atol=1e-6)
+
+
+def test_keyframer_matches_the_stored_pose_when_saved_on_frame_0():
+    arm = compose((3, 1, 2), (0, 0, 30))
+    hand = arm @ compose((0, 2, 0), (40, 0, 0))
+    data = _keyed_file([_mesh_object("arm", arm), _mesh_object("hand", hand)],
+                       [_kf_node("arm", 0, pos=(3, 1, 2), rot=(-np.radians(30), 0, 0, 1)),
+                        _kf_node("hand", 1, parent=0, pos=(0, 2, 0), rot=(-np.radians(40), 1, 0, 0))])
+    keyed = _world_points(max3ds.read(data))
+    stored = _world_points(max3ds.read(data[:data.index(struct.pack("<H", max3ds.KFDATA))]))
+    for name in ("arm", "hand"):
+        np.testing.assert_allclose(keyed[name], stored[name], atol=1e-5)
+
+
+def test_keyframer_dummies_and_instances():
+    objects = [_mesh_object("tree", np.eye(4))]
+    nodes = [_kf_node(max3ds.DUMMY, 0, pos=(0, 0, 5), instance="forest"),
+             _kf_node("tree", 1, parent=0, pos=(1, 0, 0)),
+             _kf_node("tree", 2, parent=0, pos=(-1, 0, 0), instance="second")]
+    scene = max3ds.read(_keyed_file(objects, nodes))
+    (forest,) = scene.roots
+    assert forest.name == "forest" and forest.mesh is None
+    assert [c.name for c in forest.children] == ["tree", "tree.second"]
+    assert forest.children[0].mesh is forest.children[1].mesh  # one mesh, used twice
+    points = _world_points(scene)
+    np.testing.assert_allclose(points["tree"][0], [1, 0, 5], atol=1e-6)
+    np.testing.assert_allclose(points["tree.second"][0], [-1, 0, 5], atol=1e-6)
+
+
+def test_keyframer_camera_parent():
+    # A camera at the origin aiming down +Y; its child sits 4 units in front of it (local -Z).
+    objects = [_mesh_object("box", np.eye(4))]
+    nodes = [_kf_node("cam", 0, kind=max3ds.CAMERA_NODE, pos=(0, 0, 0)),
+             _kf_node("cam", 1, kind=max3ds.TARGET_NODE, pos=(0, 10, 0)),
+             _kf_node("box", 2, parent=0, pos=(0, 0, -4))]
+    scene = max3ds.read(_keyed_file(objects, nodes))
+    assert [n.name for n in scene.roots] == ["cam"] and scene.roots[0].mesh is None
+    np.testing.assert_allclose(_world_points(scene)["box"][0], [0, 4, 0], atol=1e-6)
+
+
+def test_keyframer_lone_camera_is_dropped_and_light_children_keep_their_pose():
+    where = compose((7, 8, 9))
+    objects = [_mesh_object("lamp", where)]
+    nodes = [_kf_node("cam", 0, kind=max3ds.CAMERA_NODE, pos=(0, 0, 0)),
+             _kf_node("sun", 1, kind=0xB005, pos=(100, 100, 100)),  # a light: meshport doesn't place lights
+             _kf_node("lamp", 2, parent=1, pos=(0, 0, 0))]
+    scene = max3ds.read(_keyed_file(objects, nodes))
+    assert [n.name for n in scene.roots] == ["lamp"]
+    np.testing.assert_allclose(_world_points(scene)["lamp"][0], [7, 8, 9], atol=1e-6)
+
+
+def test_keyframer_loops_are_cut():
+    objects = [_mesh_object("a", np.eye(4)), _mesh_object("b", np.eye(4))]
+    nodes = [_kf_node("a", 0, parent=1, pos=(0, 0, 0)), _kf_node("b", 1, parent=0, pos=(0, 0, 0))]
+    scene = max3ds.read(_keyed_file(objects, nodes))
+    assert sum(1 for _ in scene.walk()) == 2

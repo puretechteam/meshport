@@ -117,7 +117,7 @@ Not handled: animation, skinning, blend shapes, cameras and lights. Rigged chara
 - There is no hierarchy: every mesh is written as its own object, in place.
 - Object names are cut to 10 characters and material names to 16, kept unique. Texture files get 8.3 names, which every 3DS reader accepts.
 
-When reading 3DS, the keyframer section (animation and hierarchy), lights and cameras are skipped.
+When reading 3DS, the keyframer section supplies the hierarchy, pivots, dummy groups and instances. Animated files open at their first frame, as in Blender and Assimp. The animation itself, lights and cameras are skipped; a camera that other objects hang from is kept as an empty group.
 
 Textures that glTF can't hold (TGA, PSD, TIFF, ...) are re-encoded to PNG when [Pillow](https://pypi.org/project/Pillow/) is installed (`pip install meshport[images]`), and left out otherwise.
 
@@ -147,7 +147,7 @@ Conventions are glTF's: right-handed, +Y up, 1 unit = 1 meter. UVs have v = 0 at
   - **2 Blender gets wrong:** both are copies of one model that uses geometric rotation, and Unity agrees with meshport.
 
   Where a file has back-to-back duplicate faces (two-sided walls), Blender deletes them and meshport keeps them.
-- **Real-world 3DS files.** Assimp's 15 sample `.3ds` files, mostly exported from 3ds Max, all read. 13 match Blender's import vertex for vertex. The other 2 are animated: meshport keeps the pose the file was saved in, and Blender shows the first frame of the animation. Each file also re-saves as 3DS, glTF and FBX with every triangle in place.
+- **Real-world 3DS files.** Assimp's 15 sample `.3ds` files, mostly exported from 3ds Max, all read. 14 match Blender's import vertex for vertex. In the 15th, a box hangs from an animated camera. That file was saved on frame 0, so its stored geometry shows where 3ds Max had the box, and meshport puts it there; Blender's camera handling puts it 41 units away. Every file saved on frame 0 comes out exactly as its stored geometry. Each file also re-saves as 3DS, glTF and FBX with every triangle in place.
 - **Against ufbx and Assimp.** See [Why meshport?](#why-meshport) and `benchmarks/compare_readers.py`.
 - **The test suite** (`pytest`) builds its own files. It checks round trips, hand-written ASCII 6 and 7 files, every transform feature, glTF corner cases (interleaved buffers, sparse accessors, strips, external buffers), 3DS smoothing groups and mesh splitting, damaged and hostile files in every format and, when Blender is installed, both directions of Blender interop.
 

@@ -6,22 +6,33 @@ import zlib
 
 import numpy as np
 import pytest
+from test_3ds import _keyed_file, _kf_node, _mesh_object
 
 import meshport
 from meshport import MeshportError, fbx, max3ds
 from meshport.fbxtree import Record, write_ascii, write_binary
 
 
+def _keyed_3ds():
+    """A 3DS file with a keyframer: a camera, a dummy group, an instance and a pivot."""
+    objects = [_mesh_object("a", np.eye(4)), _mesh_object("b", np.eye(4))]
+    nodes = [_kf_node("cam", 0, kind=max3ds.CAMERA_NODE, pos=(0, 0, 0)), _kf_node("cam", 1, kind=max3ds.TARGET_NODE,
+             pos=(0, 5, 0)), _kf_node(max3ds.DUMMY, 2, 0, pos=(1, 2, 3), instance="g"),
+             _kf_node("a", 3, 2, pos=(1, 0, 0), rot=(0.5, 0, 0, 1), scale=(1, 2, 1), pivot=(0.5, 0, 0)),
+             _kf_node("a", 4, 3, pos=(0, 1, 0), instance="copy"), _kf_node("b", 5, 4, pos=(0, 0, 1))]
+    return _keyed_file(objects, nodes)
+
+
 def _samples(scene):
     return {"fbx": meshport.write(scene, "fbx"), "glb": meshport.write(scene, "glb"),
-            "gltf": meshport.write(scene, "gltf"), "3ds": meshport.write(scene, "3ds"),
+            "gltf": meshport.write(scene, "gltf"), "3ds": meshport.write(scene, "3ds"), "3ds-keyframer": _keyed_3ds(),
             "ascii": write_ascii(fbx._Writer(scene).records()).encode()}
 
 
-@pytest.mark.parametrize("kind", ["fbx", "glb", "gltf", "ascii", "3ds"])
+@pytest.mark.parametrize("kind", ["fbx", "glb", "gltf", "ascii", "3ds", "3ds-keyframer"])
 def test_corrupted_files_raise_meshport_error(scene, kind):
     data = _samples(scene)[kind]
-    fmt = "fbx" if kind == "ascii" else kind
+    fmt = {"ascii": "fbx", "3ds-keyframer": "3ds"}.get(kind, kind)
     rng = random.Random(kind)
     for _ in range(300):
         b = bytearray(data)
@@ -87,6 +98,13 @@ def _3ds_mesh(*parts: bytes) -> bytes:
 ])
 def test_hostile_3ds_raises_meshport_error(data):
     with pytest.raises(MeshportError):
+        meshport.read(data, "3ds")
+
+
+def test_3ds_animation_key_cut_short():
+    track = max3ds._chunk(max3ds.POS_TRACK, struct.pack("<H8xI", 0, 1))  # claims a key, then stops
+    data = _keyed_file([_mesh_object("a", np.eye(4))], [max3ds._chunk(max3ds.OBJECT_NODE, track)])
+    with pytest.raises(MeshportError, match="animation key is cut short"):
         meshport.read(data, "3ds")
 
 
