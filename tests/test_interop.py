@@ -3,6 +3,7 @@
 import json
 import subprocess
 import textwrap
+from importlib.util import find_spec
 
 import numpy as np
 import pytest
@@ -80,7 +81,7 @@ def test_we_read_blenders_fbx(tmp_path):
 
 _BLENDER_3DS_SCRIPT = textwrap.dedent("""
     import addon_utils, bpy, json, sys
-    src, out = sys.argv[sys.argv.index("--") + 1:]
+    src, out, glb = sys.argv[sys.argv.index("--") + 1:]
     bpy.ops.wm.read_factory_settings(use_empty=True)
 
     def have_importer():
@@ -89,38 +90,70 @@ _BLENDER_3DS_SCRIPT = textwrap.dedent("""
         except KeyError:
             return False
 
-    # Blender 4.2+ ships the 3DS importer as an extension, older versions as a bundled add-on.
-    for module in ("io_scene_3ds", "bl_ext.blender_org.io_scene_3ds", "bl_ext.user_default.io_scene_3ds"):
+    # Blender 4.2+ has the 3DS importer as the "autodesk_3ds_format" extension; before, it was
+    # the bundled io_scene_3ds add-on.
+    modules = ["io_scene_3ds"] + [f"bl_ext.{repo}.autodesk_3ds_format" for repo in ("blender_org", "user_default")]
+    for module in modules:
         try:
             addon_utils.enable(module, default_set=False)
         except Exception:
             pass
         if have_importer():
             break
-    if have_importer():
+    if have_importer() and src == "export":  # Blender writes a 3DS file, and a GLB to compare with
+        bpy.ops.mesh.primitive_monkey_add(rotation=(0.3, 0.2, 0.1), location=(1, 2, 3))
+        bpy.ops.mesh.primitive_cylinder_add(vertices=7, location=(-2, 0, 1), scale=(1, 2, 0.5))
+        bpy.ops.object.shade_smooth()
+        bpy.ops.export_scene.max3ds(filepath=out.replace(".json", ".3ds"))
+        bpy.ops.export_scene.gltf(filepath=glb, export_format="GLB")
+        report = {}
+    elif have_importer():
         names = bpy.ops.import_scene.max3ds.get_rna_type().properties.keys()
         options = {"constrain_size": 0.0} if "constrain_size" in names else {}
         bpy.ops.import_scene.max3ds(filepath=src, **options)
         meshes = [[len(o.data.vertices), len(o.data.polygons)] for o in bpy.data.objects if o.type == "MESH"]
         report = {"meshes": sorted(meshes)}
+        bpy.ops.export_scene.gltf(filepath=glb, export_format="GLB")
     else:
-        report = {"skip": "Blender's 3DS importer (io_scene_3ds) isn't installed"}
+        report = {"skip": "Blender's 3DS importer (the autodesk_3ds_format extension) isn't installed"}
     with open(out, "w") as f:
         json.dump(report, f)
 """)
 
 
-@pytest.mark.skipif(BLENDER is None, reason="Blender isn't installed")
-def test_blender_reads_our_3ds(scene, tmp_path):
-    meshport.save(scene, tmp_path / "ours.3ds")
+def _blender_3ds(tmp_path, src: str) -> dict:
     script = tmp_path / "script3ds.py"
     script.write_text(_BLENDER_3DS_SCRIPT)
     subprocess.run([BLENDER, "-b", "--factory-startup", "-noaudio", "--python-exit-code", "1", "--python", str(script),
-                    "--", str(tmp_path / "ours.3ds"), str(tmp_path / "blender.json")],
+                    "--", src, str(tmp_path / "blender.json"), str(tmp_path / "blender.glb")],
                    check=True, capture_output=True, timeout=300)
     report = json.loads((tmp_path / "blender.json").read_text())
     if "skip" in report:
         pytest.skip(report["skip"])
+    return report
+
+
+@pytest.mark.skipif(BLENDER is None, reason="Blender isn't installed")
+def test_blender_reads_our_3ds(scene, tmp_path):
+    meshport.save(scene, tmp_path / "ours.3ds")
+    report = _blender_3ds(tmp_path, str(tmp_path / "ours.3ds"))
     ours = meshport.load(tmp_path / "ours.3ds")
     want = sorted([len(n.mesh.positions), len(n.mesh.face_sizes)] for n, _ in ours.walk() if n.mesh is not None)
     assert report["meshes"] == want
+    if find_spec("scipy"):  # and Blender put every vertex where meshport meant it to be
+        assert _vertex_gap(meshport.load(tmp_path / "blender.glb"), scene) < 1e-5
+
+
+@pytest.mark.skipif(BLENDER is None, reason="Blender isn't installed")
+def test_we_read_blenders_3ds(tmp_path):
+    pytest.importorskip("scipy")
+    _blender_3ds(tmp_path, "export")
+    ours, theirs = meshport.load(tmp_path / "blender.3ds"), meshport.load(tmp_path / "blender.glb")
+    assert _vertex_gap(ours, theirs) < 1e-5
+    meshes = {n.name: n.mesh for n, _ in ours.walk()}
+    assert meshes["Suzanne"].normals is None  # flat shaded: no smoothing groups
+    cylinder = meshes["Cylinder"]  # smooth shaded: the sides bend, the caps stay flat
+    p = cylinder.positions[cylinder.corners].reshape(-1, 3, 3)
+    flat = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
+    flat /= np.linalg.norm(flat, axis=1, keepdims=True)
+    assert 0.3 < (np.einsum("ij,ij->i", cylinder.normals, np.repeat(flat, 3, 0)) < 0.999).mean() < 0.9
