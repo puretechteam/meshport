@@ -7,7 +7,7 @@ from conftest import nodes_by_name, png, world_triangles
 import meshport
 from meshport import Image, Material, Mesh, MeshportError, Node, Scene, max3ds
 from meshport.__main__ import main
-from meshport.geometry import compose
+from meshport.geometry import compose, transform_normals, transform_points
 from meshport.max3ds import _chunk, _chunks
 
 
@@ -37,14 +37,18 @@ def test_round_trip_keeps_geometry_uvs_materials_and_names(scene):
     for name in got:
         node, world = want[name]
         other, other_world = got[name]
-        np.testing.assert_allclose(other_world, world, atol=1e-6)
         a, b = node.mesh, other.mesh
-        tris = a.triangles().ravel()
-        np.testing.assert_allclose(b.positions[b.corners], a.positions[a.corners[tris]], atol=1e-6)
+        tris = a.triangles()
+        if np.linalg.det(world[:3, :3]) < 0:  # written in world space, a mirrored mesh turns its faces round
+            tris = tris[:, ::-1]
+        tris = tris.ravel()
+        np.testing.assert_allclose(transform_points(other_world, b.positions[b.corners]),
+                                   transform_points(world, a.positions[a.corners[tris]]), atol=1e-5)
         if a.uvs:
             np.testing.assert_allclose(b.uvs[0], a.uvs[0][tris], atol=1e-6)
         if a.normals is not None:
-            np.testing.assert_allclose(b.normals, a.normals[tris], atol=1e-6)
+            np.testing.assert_allclose(transform_normals(other_world, b.normals),
+                                       transform_normals(world, a.normals[tris]), atol=1e-5)
         else:
             assert b.normals is None
         slots = a.face_materials[a.triangle_faces()] if a.face_materials is not None else 0
@@ -361,3 +365,25 @@ def test_vertices_at_the_same_spot_stay_apart():
     mesh = Mesh("m", p, np.array([3, 3]), np.arange(6))
     back = max3ds.read(max3ds.write(Scene([Node("m", mesh=mesh)]))).roots[0].mesh
     assert len(back.positions) == 6
+
+
+def test_objects_are_written_in_world_space_with_identity_matrices(scene):
+    # 3ds Max-style readers (Autodesk's FBX SDK among them) take the points into the object's
+    # own space with the inverse of its matrix and then place the object by the keyframer, at
+    # the origin when there is none. Blender-style readers place it by the matrix. With world
+    # points and identity matrices, both put every object where it belongs.
+    data = max3ds.write(scene)
+    matrices = []
+
+    def walk(s, e):
+        for cid, cs, ce in _chunks(data, s, e):
+            if cid in (max3ds.MAIN, max3ds.EDIT, max3ds.TRIMESH):
+                walk(cs, ce)
+            elif cid == max3ds.OBJECT:
+                walk(max3ds._cstring(data, cs, ce)[1], ce)
+            elif cid == max3ds.MESH_MATRIX:
+                matrices.append(np.frombuffer(data, "<f4", 12, cs).reshape(4, 3))
+    walk(0, len(data))
+    assert len(matrices) == 3 and all(np.array_equal(m, np.eye(4)[:3].T) for m in matrices)
+    assert max3ds.KFDATA not in {cid for cid, _, _ in _chunks(data, 6, len(data))}
+    _same_geometry(scene, max3ds.read(data))

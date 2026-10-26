@@ -13,7 +13,11 @@ The format's limits shape the writer: a mesh is triangles with at most 65,535 ve
 65,535 faces, one UV per vertex, and normals only as smoothing groups. Bigger meshes are
 split into several objects, vertices are split wherever a UV or normal changes, object
 names are cut to 10 characters and material names to 16, and textures are referenced by
-8.3 file names (write_file puts the image files next to the model).
+8.3 file names (write_file puts the image files next to the model). Every object is written
+in world space with an identity matrix and no keyframer, so the hierarchy is flattened; that
+is the one layout that 3ds Max-style readers (which place objects by the keyframer and
+default to the origin without one) and Blender-style readers (which place them by the
+matrix) both put in the right place.
 
 3DS is Z-up, and 1 unit is taken as 1 meter.
 """
@@ -329,14 +333,22 @@ class _Reader:
         if matrix is None or not np.all(np.isfinite(matrix)) or abs(np.linalg.det(matrix)) < 1e-12:
             matrix = np.eye(4)
         positions = transform_points(np.linalg.inv(matrix), points)
+        normals = None
+        if smooth is not None:
+            # Smoothed where the points are stored, as Autodesk's 3DS reader does (it matters
+            # under non-uniform scale), then turned into the object's space (inverse-transpose).
+            world = _smooth_normals(points, tris, smooth)
+            normals = world @ matrix[:3, :3]
+            length = np.linalg.norm(normals, axis=1, keepdims=True)
+            normals = np.divide(normals, length, out=np.zeros_like(normals), where=length > 0)
         if np.linalg.det(matrix) < 0:  # a mirrored matrix flips the faces: keep them facing out
             tris = tris[:, ::-1]
+            if normals is not None:
+                normals = normals.reshape(-1, 3, 3)[:, ::-1].reshape(-1, 3)
         corners = tris.ravel()
-        mesh = Mesh(name, positions, np.full(len(tris), 3, np.int64), corners)
+        mesh = Mesh(name, positions, np.full(len(tris), 3, np.int64), corners, normals)
         if uvs is not None and len(uvs) >= len(points):
             mesh.uvs = [uvs[corners]]
-        if smooth is not None:
-            mesh.normals = _smooth_normals(positions, tris, smooth)
         node = Node(name, _Z_UP @ matrix, mesh)
         if groups:
             slots = np.full(len(tris), -1, np.int64)
@@ -482,22 +494,18 @@ def _shifted(mesh: Mesh, offset: np.ndarray) -> Mesh:
 
 def _smooth_normals(positions: np.ndarray, tris: np.ndarray, groups: np.ndarray) -> np.ndarray:
     """Per-corner normals from smoothing groups: a corner averages the faces around its
-    vertex that share a group bit with its own face; faces in no group stay flat."""
+    vertex that share a group bit with its own face, each face counting the same (as
+    Autodesk's 3DS reader does); faces in no group stay flat."""
     p = positions[tris]
     face_n = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
     length = np.linalg.norm(face_n, axis=1, keepdims=True)
     face_n = np.divide(face_n, length, out=np.zeros_like(face_n), where=length > 0)
-    # Each face counts by its angle at the corner, as in Blender.
-    edge_a, edge_b = np.roll(p, -1, axis=1) - p, np.roll(p, 1, axis=1) - p
-    cos = np.einsum("fki,fki->fk", edge_a, edge_b) / np.maximum(
-        np.linalg.norm(edge_a, axis=2) * np.linalg.norm(edge_b, axis=2), 1e-300)
-    weighted = face_n[:, None, :] * np.arccos(np.clip(cos, -1.0, 1.0))[:, :, None]  # (F, 3 corners, 3)
     out = np.repeat(face_n, 3, axis=0).reshape(-1, 3, 3)
     masks = np.unique(groups[groups != 0])
 
     def around(faces: np.ndarray) -> np.ndarray:
-        """Per vertex: the angle-weighted sum of these faces' normals."""
-        idx, w = tris[faces].ravel(), weighted[faces].reshape(-1, 3)
+        """Per vertex: the sum of these faces' unit normals."""
+        idx, w = tris[faces].ravel(), np.repeat(face_n[faces], 3, axis=0)
         return np.stack([np.bincount(idx, w[:, k], len(positions)) for k in range(3)], 1)
 
     if len(masks) <= 64:  # exact: each distinct mask gathers every face it shares a bit with
@@ -604,7 +612,7 @@ class _Writer:
 
     def _objects(self, node: Node, world: np.ndarray) -> list[bytes]:
         mesh = node.mesh
-        matrix = np.linalg.inv(_Z_UP) @ world  # the object's axes, in 3DS space
+        matrix = np.linalg.inv(_Z_UP) @ world  # into 3DS space, where the points are stored
         tris = mesh.triangles()
         if not len(tris):
             return []
@@ -631,7 +639,7 @@ class _Writer:
             slots = np.zeros(len(tris), np.int64) if mesh.face_materials is None else \
                 np.clip(mesh.face_materials[tri_face], 0, len(node.materials) - 1)
             names = [self._material(m) for m in node.materials]
-        matrix_bytes = _chunk(MESH_MATRIX, matrix[:3, :].T.astype("<f4").tobytes())
+        matrix_bytes = _chunk(MESH_MATRIX, np.eye(4)[:3, :].T.astype("<f4").tobytes())
         out = []
         for start, stop in _split(index):
             used, local = np.unique(index[start:stop], return_inverse=True)

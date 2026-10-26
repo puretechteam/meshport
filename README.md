@@ -147,12 +147,12 @@ Conventions are glTF's: right-handed, +Y up, 1 unit = 1 meter. UVs have v = 0 at
   - **2 Blender gets wrong:** both are copies of one model that uses geometric rotation, and Unity agrees with meshport.
 
   Where a file has back-to-back duplicate faces (two-sided walls), Blender deletes them and meshport keeps them.
-- **Real-world 3DS files.** Assimp's 15 sample `.3ds` files, mostly exported from 3ds Max, plus one with no file extension:
-  - All read. Positions, UVs, material colors, opacity and textures match Blender's import on every file, except one object described below.
-  - Every file saved on its first frame comes out exactly as its stored geometry, hierarchy included. One of them has a box hanging from an animated camera, and Blender's camera handling puts that box 41 units from where the file has it.
-  - Normals follow the smoothing groups exactly, checked against a literal implementation of the rule. Blender's normals differ on some files because its importer adds rules of its own: it only sharpens edges flagged visible, and then sharpens every edge of such a face. An emulation of Blender's rule reproduces its normals on those files.
-  - Each file re-saves as 3DS, glTF and FBX with every triangle in place. Blender reads meshport's re-saved 3DS files with the same objects, vertices and faces as the originals, and the same positions.
-  - To rerun these checks on your own files: `MESHPORT_3DS_CORPUS=path/to/folder pytest tests/test_corpus_3ds.py`.
+- **3DS against Autodesk's own reader.** Unity imports `.3ds` through Autodesk's FBX SDK, whose 3DS reader is built on Autodesk's 3DS File Toolkit. `tests/test_autodesk_3ds.py` runs it (set `MESHPORT_UNITY` to Unity.exe):
+  - Files written by meshport (rotated, mirrored, textured, and a mesh split in two) import with every point, normal and UV where meshport put it.
+  - Keyframer cases (rotation keys, pivots, a non-uniformly scaled parent) are placed the same way by both.
+  - Assimp's 15 sample `.3ds` files, mostly from 3ds Max, and meshport's re-saved copies of them: same points, normals and UVs, with one exception. Autodesk's reader ignores a camera's aim when placing an object hung from it. 3ds Max doesn't: the one such file stores the object exactly where meshport puts it.
+- **3DS against Blender.** Blender's 3DS add-on reads meshport's files with the same counts and positions, and meshport reads Blender's. On the sample files, positions, UVs and materials agree. Normals differ on some, because Blender weights faces by angle and adds sharp edges of its own; meshport follows Autodesk's rule.
+- **Real-world 3DS files, on their own.** Every file saved on its first frame comes out exactly as its stored geometry, hierarchy included, and normals match a literal implementation of the smoothing-group rule. To rerun on your own files: `MESHPORT_3DS_CORPUS=path/to/folder pytest tests/test_corpus_3ds.py` (add `MESHPORT_UNITY` to compare with Autodesk's reader too).
 - **Against ufbx and Assimp.** See [Why meshport?](#why-meshport) and `benchmarks/compare_readers.py`.
 - **The test suite** (`pytest`) builds its own files. It checks round trips, hand-written ASCII 6 and 7 files, every transform feature, glTF corner cases (interleaved buffers, sparse accessors, strips, external buffers), 3DS smoothing groups and mesh splitting, damaged and hostile files in every format and, when Blender is installed, both directions of Blender interop.
 

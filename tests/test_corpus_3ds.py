@@ -35,24 +35,19 @@ def _gap(a, b) -> float:
 
 
 def _smoothing_by_the_rule(pts, faces, groups):
-    """The smoothing-group rule read literally: a corner sums, weighted by angle, the faces
+    """The smoothing-group rule read literally: a corner sums the unit normals of the faces
     around its vertex that share a group bit with its own face; a face in no group is flat."""
-    unit, angle, users = [], [], {}
+    unit, users = [], {}
     for i, face in enumerate(faces):
         p = pts[face]
         n = np.cross(p[1] - p[0], p[2] - p[0])
         unit.append(n / (np.linalg.norm(n) or 1))
-        a = []
-        for k in range(3):
-            u, v = p[(k + 1) % 3] - p[k], p[(k + 2) % 3] - p[k]
-            a.append(np.arccos(np.clip(u @ v / ((np.linalg.norm(u) * np.linalg.norm(v)) or 1), -1, 1)))
-            users.setdefault(face[k], []).append((i, k))
-        angle.append(a)
+        for v in face:
+            users.setdefault(v, []).append(i)
     out = []
     for i, face in enumerate(faces):
         for v in face:
-            s = unit[i] if not groups[i] else sum(
-                (unit[j] * angle[j][k] for j, k in users[v] if groups[j] & groups[i]), np.zeros(3))
+            s = unit[i] if not groups[i] else sum((unit[j] for j in users[v] if groups[j] & groups[i]), np.zeros(3))
             out.append(s / (np.linalg.norm(s) or 1))
     return np.array(out)
 
