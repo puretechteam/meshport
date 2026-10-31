@@ -115,14 +115,26 @@ def test_rotation_pivot():
 
 
 def test_pre_rotation_and_rotation_order():
+    active = Record("P", ["RotationActive", "bool", "", "", 1])
     records = _records(_one_triangle_scene())
-    _patch(records, "Model", "m", [_P("PreRotation", 90, 0, 0)])
+    _patch(records, "Model", "m", [_P("PreRotation", 90, 0, 0), active])
     np.testing.assert_allclose(_world_point(records, index=1), [0, 0, 1], atol=1e-9)
     for order, expected in [(0, [0, 2, 0]), (5, [0, 0, 2])]:  # XYZ vs ZYX
         records = _records(_one_triangle_scene())
-        _patch(records, "Model", "m", [_P("Lcl Rotation", 90, 0, 90),
+        _patch(records, "Model", "m", [_P("Lcl Rotation", 90, 0, 90), active,
                                        Record("P", ["RotationOrder", "enum", "", "", order])])
         np.testing.assert_allclose(_world_point(records), expected, atol=1e-9)
+
+
+def test_pre_and_post_rotation_wait_for_rotation_active():
+    # off (the default), Autodesk's FBX SDK ignores them, so meshport does too; the rotation order
+    # still counts (checked against the SDK in test_autodesk_fbx.py)
+    records = _records(_one_triangle_scene())
+    _patch(records, "Model", "m", [_P("PreRotation", 90, 0, 0), _P("PostRotation", 0, 30, 0)])
+    np.testing.assert_allclose(_world_point(records, index=1), [0, 1, 0], atol=1e-9)
+    records = _records(_one_triangle_scene())
+    _patch(records, "Model", "m", [_P("Lcl Rotation", 90, 0, 90), Record("P", ["RotationOrder", "enum", "", "", 5])])
+    np.testing.assert_allclose(_world_point(records), [0, 0, 2], atol=1e-9)  # ZYX
 
 
 def test_geometric_offset_moves_only_the_mesh():

@@ -1,7 +1,8 @@
 """glTF 2.0 (.gltf and .glb) <-> Scene.
 
 Reads the core spec: node hierarchy, triangle/strip/fan primitives, normals, UV sets,
-vertex colors, sparse accessors, PBR materials and their textures. Meshes compressed with
+vertex colors, sparse accessors, PBR materials and their textures, skins, morph targets, and
+animations (translation, rotation, scale and morph weights, in all three interpolations). Meshes compressed with
 Draco or meshopt are refused with a clear error. Writes GLB with everything in one file,
 or .gltf with the buffer and images embedded as data URIs.
 """
@@ -19,15 +20,23 @@ from urllib.parse import unquote
 import numpy as np
 
 from . import __version__
-from .geometry import scaling, translation, unique_rows
+from .geometry import decompose_trs, quaternion, scaling, translation, unique_rows
 from .scene import (
     DAMAGED,
+    INTERPOLATIONS,
+    PATHS,
+    WEIGHTS,
+    Animation,
+    Channel,
     Image,
     Material,
     Mesh,
     MeshportError,
+    Morph,
     Node,
     Scene,
+    Skin,
+    node_budget,
     read_image_file,
 )
 
@@ -35,6 +44,7 @@ _GLB_MAGIC = b"glTF"
 _JSON_CHUNK, _BIN_CHUNK = 0x4E4F534A, 0x004E4942
 _COMPONENT = {5120: np.int8, 5121: np.uint8, 5122: np.int16, 5123: np.uint16, 5125: np.uint32, 5126: np.float32}
 _WIDTH = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT2": 4, "MAT3": 9, "MAT4": 16}
+MAX_ACCESSOR_VALUES = 1 << 28  # values a file's accessors may hold in all, plus 4 per byte of its buffers
 _UNSUPPORTED = {"KHR_draco_mesh_compression": "Draco", "EXT_meshopt_compression": "meshopt",
                 "KHR_meshopt_compression": "meshopt"}
 
@@ -97,6 +107,10 @@ class _Reader:
         self._images: dict[int, Image | None] = {}
         self._materials: dict[int, Material] = {}
         self._meshes: dict[int, tuple[Mesh, list[Material]] | None] = {}
+        self._influences: dict[int, tuple[np.ndarray, np.ndarray]] = {}  # mesh -> its vertices' joints and weights
+        self._nodes: dict[int, Node] = {}
+        self._skinned: list[tuple[Node, int, int]] = []  # (node, skin, mesh)
+        self._values = 0  # accessor values read so far: an accessor without data is zeros, of any count
 
     def _list(self, key):
         return self.doc.get(key, [])
@@ -143,8 +157,11 @@ class _Reader:
         acc = self._list("accessors")[i]
         dtype = np.dtype(_COMPONENT[acc["componentType"]])
         width, count = _WIDTH[acc["type"]], acc["count"]
+        if not isinstance(count, int) or count < 0:
+            raise MeshportError("This glTF file is damaged (an accessor has a bad count)")
         if "bufferView" in acc:
             buf, offset, _, stride = self._view(acc["bufferView"])
+            self._spend(count * width)
             offset += acc.get("byteOffset", 0)
             item = dtype.itemsize * width
             if stride and stride != item:
@@ -155,6 +172,7 @@ class _Reader:
                 out = np.frombuffer(buf, dtype, count=count * width, offset=offset).reshape(count, width)
             out = out.astype(np.float64) if dtype.kind == "f" else out.copy()
         else:
+            self._spend(count * width)
             out = np.zeros((count, width), np.float64 if dtype.kind == "f" else dtype)
         sparse = acc.get("sparse")
         if sparse:
@@ -172,6 +190,13 @@ class _Reader:
             out = np.maximum(out.astype(np.float64) / info.max, -1.0)
         return out
 
+    def _spend(self, values: int) -> None:
+        self._values += values
+        limit = MAX_ACCESSOR_VALUES + 4 * sum(len(b) for b in self._buffers.values())
+        if self._values > limit:
+            raise MeshportError(f"This glTF file's accessors hold too much data (over {limit:,} values); it may be "
+                                "damaged or made to fill the memory")
+
     # ---- scene
 
     def scene(self) -> Scene:
@@ -183,11 +208,68 @@ class _Reader:
         else:  # no scene list: every node nobody points to is a root
             used = {c for n in nodes for c in n.get("children", [])}
             roots = [i for i in range(len(nodes)) if i not in used]
+        self._check_size(roots)
         built: dict[int, Node] = {}
         scene = Scene([self._node(i, built, set()) for i in roots])
         if not scene.meshes:
             raise MeshportError("No 3D geometry found in this file")
+        for node, skin, mesh in self._skinned:  # once every joint is built
+            node.skin = self._skin(skin, mesh, node.mesh)
+        scene.animations = [a for a in (self._animation(k, a) for k, a in enumerate(self._list("animations"))) if a]
         return scene
+
+    def _skin(self, i: int, mesh_index: int, mesh: Mesh) -> Skin | None:
+        """A node's skin, or None when it's damaged or its mesh has no joints and weights (the mesh
+        then stays where its node puts it)."""
+        try:
+            data = self._list("skins")[i]
+            joints = [self._nodes.get(j) for j in data.get("joints", [])]
+            if not joints or None in joints or mesh_index not in self._influences:
+                return None
+            if "inverseBindMatrices" in data:
+                binds = self.accessor(data["inverseBindMatrices"]).astype(np.float64).reshape(-1, 4, 4).transpose(0, 2, 1)
+            else:
+                binds = np.tile(np.eye(4), (len(joints), 1, 1))
+            indices, weights = self._influences[mesh_index]
+            weights = np.where(np.isfinite(weights), np.maximum(weights, 0.0), 0.0)
+            indices = np.where(weights > 0, indices, 0)
+            total = weights.sum(1, keepdims=True)
+            weights = np.divide(weights, total, out=np.zeros_like(weights), where=total > 0)
+            weights[total[:, 0] <= 0, 0] = 1.0  # a vertex nothing moves: give it to the first joint
+            skin = Skin(joints, binds, indices, weights, data.get("name", f"skin{i}"))
+            skin.validate(mesh)
+            return skin if np.isfinite(binds).all() else None
+        except (*DAMAGED, struct.error, MeshportError):
+            return None
+
+    def _check_size(self, roots: list) -> None:
+        """Refuse a hierarchy that places more than scene.MAX_NODES nodes, before building any. A node
+        listed under several parents (glTF forbids it) is built once per parent, so a chain of them
+        doubles at every step; this counts the placements without making them."""
+        nodes = self._list("nodes")
+
+        def kids(i: int) -> list[int]:
+            data = nodes[i] if isinstance(nodes[i], dict) else {}
+            got = data.get("children", [])
+            return [c for c in got if type(c) is int and 0 <= c < len(nodes)] if isinstance(got, list) else []
+
+        budget = node_budget()
+        cap = budget.left + 1
+        size: dict[int, int] = {}
+        open_: set[int] = set()
+        stack = [(r, False) for r in roots if type(r) is int and 0 <= r < len(nodes)]
+        while stack:
+            i, done = stack.pop()
+            if done:
+                size[i] = min(1 + sum(size[c] for c in kids(i)), cap)
+                open_.discard(i)
+            elif i not in size:
+                if i in open_:
+                    raise MeshportError("This glTF file's node hierarchy loops back on itself")
+                open_.add(i)
+                stack.append((i, True))
+                stack += [(c, False) for c in kids(i)]
+        budget.spend(min(sum(size.get(r, 0) for r in roots if type(r) is int), cap))
 
     def _node(self, i: int, built: dict, path: set) -> Node:
         if i in path:
@@ -196,15 +278,58 @@ class _Reader:
         if "matrix" in data:
             matrix = np.array(data["matrix"], np.float64).reshape(4, 4).T
         else:
-            matrix = translation(data.get("translation", (0, 0, 0))) @ _quat(data.get("rotation", (0, 0, 0, 1))) \
+            matrix = translation(data.get("translation", (0, 0, 0))) @ quaternion(data.get("rotation", (0, 0, 0, 1))) \
                 @ scaling(data.get("scale", (1, 1, 1)))
         node = Node(data.get("name", f"node{i}"), matrix)
+        self._nodes.setdefault(i, node)
         if "mesh" in data:
             got = self._mesh(data["mesh"])
             if got is not None:
                 node.mesh, node.materials = got
+                weights = data.get("weights")  # a node's own weights for its mesh's targets
+                if isinstance(weights, list) and len(weights) == len(node.mesh.targets) and weights:
+                    node.mesh.target_weights = np.array(weights, np.float64)
+                if "skin" in data:
+                    self._skinned.append((node, data["skin"], data["mesh"]))
         node.children = [self._node(c, built, path | {i}) for c in data.get("children", [])]
         return node
+
+    def _animation(self, k: int, data: dict) -> Animation | None:
+        """An animation's channels. A channel that's damaged, or moves something else (a node that
+        isn't in the scene, weights of a mesh without targets), is left out rather than losing the model."""
+        channels = []
+        samplers = data.get("samplers", [])
+        for ch in data.get("channels", []):
+            try:
+                target = ch["target"]
+                node, path = self._nodes.get(target.get("node")), target.get("path")
+                if node is None or (path not in PATHS and path != WEIGHTS):
+                    continue
+                width = PATHS.get(path) or (len(node.mesh.targets) if node.mesh is not None else 0)
+                sampler = samplers[ch["sampler"]]
+                interpolation = sampler.get("interpolation", "LINEAR")
+                if interpolation not in INTERPOLATIONS or not width:
+                    continue
+                times = self.accessor(sampler["input"]).astype(np.float64).ravel()
+                values = self.accessor(sampler["output"]).astype(np.float64)
+                if path == WEIGHTS:  # one scalar per target per key
+                    if values.size % width:
+                        continue
+                    values = values.reshape(-1, width)
+                cubic = interpolation == "CUBICSPLINE"
+                if values.shape[1] != width or len(values) != len(times) * (3 if cubic else 1):
+                    continue
+                if cubic:
+                    values = values.reshape(len(times), 3, width)
+                keep = np.isfinite(times) & np.isfinite(values.reshape(len(times), -1)).all(1)
+                times, values = times[keep], values[keep]
+                if not len(times):
+                    continue
+                order = np.argsort(times, kind="stable")  # keys out of order: put them in order
+                channels.append(Channel(node, path, times[order], values[order], interpolation))
+            except (*DAMAGED, struct.error):
+                continue
+        return Animation(data.get("name", f"animation{k}"), channels) if channels else None
 
     def _mesh(self, i: int):
         if i in self._meshes:
@@ -241,13 +366,42 @@ class _Reader:
                 if c.shape[1] == 3:
                     c = np.hstack([c, np.ones((len(c), 1))])
                 colors = c[corner_vertex]
-            parts.append((pos_key, pos, tris, normals, uvs, colors, slot_of[mat_index]))
+            targets = []
+            for t in prim.get("targets", []):
+                offsets = self.accessor(t["POSITION"]).astype(np.float64) if "POSITION" in t else np.zeros_like(pos)
+                shift = self.accessor(t["NORMAL"]).astype(np.float64) if "NORMAL" in t else None
+                if offsets.shape != pos.shape or (shift is not None and shift.shape != pos.shape):
+                    targets = None  # damaged: the mesh loads without them
+                    break
+                targets.append((offsets, shift[corner_vertex] if shift is not None else None))
+            parts.append((pos_key, pos, tris, normals, uvs, colors, slot_of[mat_index], targets,
+                          self._influence(attrs, len(pos))))
         if not parts:
             self._meshes[i] = None
             return None
-        mesh = _merge_parts(data.get("name", f"mesh{i}"), parts)
+        mesh, influence = _merge_parts(data.get("name", f"mesh{i}"), parts)
+        names = (data.get("extras") or {}).get("targetNames") if isinstance(data.get("extras"), dict) else None
+        for k, m in enumerate(mesh.targets):
+            m.name = str(names[k]) if isinstance(names, list) and k < len(names) else f"target{k}"
+        weights = data.get("weights")
+        if mesh.targets and isinstance(weights, list) and len(weights) == len(mesh.targets):
+            mesh.target_weights = np.array(weights, np.float64)
+        if influence is not None:
+            self._influences[i] = influence
         self._meshes[i] = (mesh, materials)
         return self._meshes[i]
+
+    def _influence(self, attrs: dict, count: int) -> tuple[np.ndarray, np.ndarray] | None:
+        """A primitive's joints and weights per vertex, every JOINTS_n/WEIGHTS_n set side by side."""
+        joints, weights, k = [], [], 0
+        while f"JOINTS_{k}" in attrs and f"WEIGHTS_{k}" in attrs:
+            j, w = self.accessor(attrs[f"JOINTS_{k}"]), self.accessor(attrs[f"WEIGHTS_{k}"])
+            if len(j) != count or j.shape != w.shape:
+                return None
+            joints.append(j.astype(np.int64))
+            weights.append(w.astype(np.float64))
+            k += 1
+        return (np.hstack(joints), np.hstack(weights)) if joints else None
 
     def _image(self, tex_info: dict | None) -> Image | None:
         if not tex_info or "index" not in tex_info:
@@ -296,17 +450,6 @@ class _Reader:
         return mat
 
 
-def _quat(q) -> np.ndarray:
-    x, y, z, w = q
-    n = np.sqrt(x * x + y * y + z * z + w * w) or 1.0
-    x, y, z, w = x / n, y / n, z / n, w / n
-    m = np.eye(4)
-    m[:3, :3] = [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-                 [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-                 [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]]
-    return m
-
-
 def _to_triangles(idx: np.ndarray, mode: int) -> np.ndarray:
     if mode == 4:
         return idx[: len(idx) // 3 * 3].reshape(-1, 3)
@@ -321,19 +464,36 @@ def _to_triangles(idx: np.ndarray, mode: int) -> np.ndarray:
     return np.stack([np.full(len(k), idx[0]), idx[k + 1], idx[k + 2]], 1)  # fan
 
 
-def _merge_parts(name: str, parts: list) -> Mesh:
+def _merge_parts(name: str, parts: list) -> tuple[Mesh, tuple[np.ndarray, np.ndarray] | None]:
+    """The primitives as one mesh, and its vertices' joints and weights when every primitive has them."""
     positions, corners, normals, colors, mats = [], [], [], [], []
     n_uv = max(len(p[4]) for p in parts)
     uvs = [[] for _ in range(n_uv)]
     has_n = all(p[3] is not None for p in parts)
     has_c = any(p[5] is not None for p in parts)
+    counts = {len(p[7]) if p[7] is not None else -1 for p in parts}
+    n_targets = counts.pop() if len(counts) == 1 and counts != {-1} else 0  # glTF: every primitive has as many
+    target_pos = [[] for _ in range(n_targets)]
+    target_nrm = [[] for _ in range(n_targets)]
+    has_tn = has_n and n_targets > 0 and all(t[1] is not None for p in parts for t in p[7])
+    skinned = all(p[8] is not None for p in parts)
+    width = max(p[8][0].shape[1] for p in parts) if skinned else 0
+    joints, weights = [], []
     offsets: dict[int, int] = {}  # primitives often share one vertex buffer: store it once
     total = 0
-    for key, pos, tris, nrm, uv, col, slot in parts:
+    for key, pos, tris, nrm, uv, col, slot, targets, influence in parts:
         if key not in offsets:
             offsets[key] = total
             positions.append(pos)
             total += len(pos)
+            for m in range(n_targets):
+                target_pos[m].append(targets[m][0])
+            if skinned:
+                pad = width - influence[0].shape[1]
+                joints.append(np.pad(influence[0], ((0, 0), (0, pad))))
+                weights.append(np.pad(influence[1], ((0, 0), (0, pad))))
+        for m in range(n_targets if has_tn else 0):
+            target_nrm[m].append(targets[m][1])
         corners.append(tris.ravel() + offsets[key])
         c = tris.size
         if has_n:
@@ -349,8 +509,10 @@ def _merge_parts(name: str, parts: list) -> Mesh:
                 [np.concatenate(u) for u in uvs],
                 np.concatenate(colors).astype(np.float64) if has_c else None,
                 np.concatenate(mats))
+    mesh.targets = [Morph(f"target{m}", np.concatenate(target_pos[m]),
+                          np.concatenate(target_nrm[m]) if has_tn else None) for m in range(n_targets)]
     mesh.validate()
-    return mesh
+    return mesh, ((np.concatenate(joints), np.concatenate(weights)) if skinned else None)
 
 
 # ============================================================================ writing
@@ -392,13 +554,73 @@ class _Writer:
         self.meshes: dict[tuple, int] = {}
         self.materials: dict[int, int] = {}
         self.images: dict[int, int | None] = {}
+        self.nodes: dict[int, int] = {}
+        self.animated = {id(c.node) for a in scene.animations for c in a.channels if c.path in PATHS}
+        in_scene = {id(n) for n, _ in scene.walk()}
+        # a skin whose joints are all in the scene (glTF's joints are nodes); the others are left out
+        self.skins = {id(n): n.skin for n, _ in scene.walk() if n.skin is not None and n.mesh is not None
+                      and all(id(j) in in_scene for j in n.skin.joints)}
+        self.skin_of: dict[int, int] = {}
+        self.pending: list[tuple[dict, Skin]] = []  # nodes waiting for their skin's joints to be written
+        # a skinned mesh's transforms don't move it (glTF ignores them), so one that hangs under another
+        # node is written as a root of the scene without one: what glTF recommends
+        roots = {id(n) for n in scene.roots}
+        self.lifted: dict[int, np.ndarray] = {}  # node -> its matrix as a root
+        for n, _ in scene.walk():
+            if id(n) in self.skins and id(n) not in roots and not n.children and id(n) not in self.animated:
+                self.lifted[id(n)] = np.eye(4)
+        self.lifted_nodes = [n for n, _ in scene.walk() if id(n) in self.lifted]
 
     def _arr(self, key: str) -> list:
         return self.doc.setdefault(key, [])
 
     def build(self) -> tuple[dict, bytes]:
-        self.doc["scenes"][0]["nodes"] = [self._node(n) for n in self.scene.roots]
+        roots = [self._node(n) for n in self.scene.roots] + [self._node(n, as_root=True) for n in self.lifted_nodes]
+        self.doc["scenes"][0]["nodes"] = [r for r in roots if r is not None]
+        for out, skin in self.pending:
+            out["skin"] = self._skin(skin)
+        for animation in self.scene.animations:
+            self._animation(animation)
         return self.doc, bytes(self.blob)
+
+    def _skin(self, skin: Skin) -> int:
+        if id(skin) not in self.skin_of:
+            binds = np.array(skin.inverse_binds, np.float64)
+            binds[:, 3] = (0, 0, 0, 1)  # exactly, as glTF requires (arithmetic on the way can leave 1e-17s)
+            binds = binds.transpose(0, 2, 1).reshape(-1, 16)  # column major
+            self._arr("skins").append({"name": skin.name, "joints": [self.nodes[id(j)] for j in skin.joints],
+                                       "inverseBindMatrices": self._accessor(binds.astype(np.float32), "MAT4", None)})
+            self.skin_of[id(skin)] = len(self.doc["skins"]) - 1
+        return self.skin_of[id(skin)]
+
+    def _animation(self, animation: Animation) -> None:
+        samplers, channels, inputs = [], [], {}
+        for c in animation.channels:
+            if id(c.node) not in self.nodes or not len(c.times):
+                continue  # its node isn't in the scene
+            # glTF's times are 32-bit: keys closer than that (a key next to a frame sample) are one key
+            times = np.asarray(c.times, np.float32)
+            keep = np.concatenate(([True], ~((np.diff(c.times) > 0) & (np.diff(times) <= 0))))
+            times, c = times[keep], Channel(c.node, c.path, c.times[keep], c.values[keep], c.interpolation)
+            if c.path == WEIGHTS:
+                out = self.doc["nodes"][self.nodes[id(c.node)]]
+                targets = len(c.node.mesh.targets) if c.node.mesh is not None and "mesh" in out else 0
+                if not targets or c.values.shape[-1] != targets:
+                    continue  # no targets for it to move
+                values, kind = np.asarray(c.values, np.float32).reshape(-1, 1), "SCALAR"  # each key's weights in turn
+            elif c.path in PATHS:
+                values = np.asarray(c.values, np.float32).reshape(-1, PATHS[c.path])
+                kind = "VEC4" if c.path == "rotation" else "VEC3"
+            else:
+                continue
+            key = times.tobytes()
+            if key not in inputs:  # channels keyed at the same times share one accessor
+                inputs[key] = self._accessor(times, "SCALAR", None, bounds=True)
+            samplers.append({"input": inputs[key], "output": self._accessor(values, kind, None),
+                             "interpolation": c.interpolation})
+            channels.append({"sampler": len(samplers) - 1, "target": {"node": self.nodes[id(c.node)], "path": c.path}})
+        if channels:
+            self._arr("animations").append({"name": animation.name, "samplers": samplers, "channels": channels})
 
     def _view(self, data: bytes, target: int | None = None) -> int:
         self.blob += b"\0" * (-len(self.blob) % 4)
@@ -415,28 +637,40 @@ class _Writer:
         acc = {"bufferView": self._view(np.ascontiguousarray(a).tobytes(), target),
                "componentType": component, "count": len(a), "type": kind}
         if bounds:
-            acc["min"] = a.min(0).tolist()
-            acc["max"] = a.max(0).tolist()
+            acc["min"] = np.atleast_1d(a.min(0)).tolist()  # always a list, a scalar's too
+            acc["max"] = np.atleast_1d(a.max(0)).tolist()
         self._arr("accessors").append(acc)
         return len(self.doc["accessors"]) - 1
 
-    def _node(self, node: Node) -> int:
+    def _node(self, node: Node, as_root: bool = False) -> int | None:
+        if id(node) in self.lifted and not as_root:
+            return None  # written as a root instead
         idx = len(self.doc["nodes"])
         out = {"name": node.name}
         self.doc["nodes"].append(out)
-        if not np.allclose(node.matrix, np.eye(4)):
-            out["matrix"] = node.matrix.T.ravel().tolist()
+        self.nodes.setdefault(id(node), idx)
+        matrix = self.lifted[id(node)] if as_root else node.matrix
+        if id(node) in self.animated:  # glTF animates translation, rotation and scale, never a matrix
+            t, q, s = decompose_trs(node.matrix)
+            for name, value, rest in (("translation", t, (0, 0, 0)), ("rotation", q, (0, 0, 0, 1)), ("scale", s, (1, 1, 1))):
+                if not np.allclose(value, rest):
+                    out[name] = [float(v) for v in value]
+        elif not np.allclose(matrix, np.eye(4)):
+            out["matrix"] = np.asarray(matrix).T.ravel().tolist()
         if node.mesh is not None:
-            m = self._mesh(node.mesh, node.materials)
+            skin = self.skins.get(id(node))
+            m = self._mesh(node.mesh, node.materials, skin)
             if m is not None:
                 out["mesh"] = m
-        kids = [self._node(c) for c in node.children]
+                if skin is not None:
+                    self.pending.append((out, skin))
+        kids = [k for k in (self._node(c) for c in node.children) if k is not None]
         if kids:
             out["children"] = kids
         return idx
 
-    def _mesh(self, mesh: Mesh, materials: list[Material]) -> int | None:
-        key = (id(mesh), tuple(id(m) for m in materials))
+    def _mesh(self, mesh: Mesh, materials: list[Material], skin: Skin | None = None) -> int | None:
+        key = (id(mesh), tuple(id(m) for m in materials), id(skin))
         if key in self.meshes:
             return self.meshes[key]
         tris = mesh.triangles()
@@ -445,16 +679,22 @@ class _Writer:
         tri_face = mesh.triangle_faces()
         corner = tris.ravel()
         # One glTF vertex per distinct (position, normal, uv..., color) combination.
-        columns = [mesh.positions[mesh.corners[corner]]]
+        columns = [mesh.positions[mesh.corners[corner]].astype(np.float32)]
         if mesh.normals is not None:
-            columns.append(mesh.normals[corner])
+            columns.append(mesh.normals[corner].astype(np.float32))
         for uv in mesh.uvs:
-            columns.append(uv[corner])
+            columns.append(uv[corner].astype(np.float32))
         if mesh.colors is not None:
-            columns.append(mesh.colors[corner])
-        table = np.hstack(columns).astype(np.float32)
+            columns.append(mesh.colors[corner].astype(np.float32))
+        if mesh.targets or skin is not None:  # vertices in the same place can move apart: keep them apart
+            columns.append(mesh.corners[corner].astype(np.int32).view(np.float32)[:, None])
+        normal_shift = mesh.normals is not None and all(m.normals is not None for m in mesh.targets)
+        if mesh.targets and normal_shift:
+            columns += [m.normals[corner].astype(np.float32) for m in mesh.targets]
+        table = np.hstack(columns)
         first, inverse = unique_rows(table)
         vertices = table[first]
+        source = mesh.corners[corner[first]]  # each glTF vertex's position in the mesh
         index = inverse.reshape(-1, 3)
 
         col = 0
@@ -475,6 +715,15 @@ class _Writer:
             col += 2
         if mesh.colors is not None:
             attrs["COLOR_0"] = self._accessor(np.clip(vertices[:, col:col + 4], 0, 1), "VEC4", 34962)
+        if skin is not None:
+            self._influences(attrs, skin, source)
+        targets = []
+        for k, m in enumerate(mesh.targets):
+            target = {"POSITION": self._accessor(m.positions[source].astype(np.float32), "VEC3", 34962, bounds=True)}
+            if normal_shift:
+                at = vertices.shape[1] - 3 * (len(mesh.targets) - k)
+                target["NORMAL"] = self._accessor(np.ascontiguousarray(vertices[:, at:at + 3]), "VEC3", 34962)
+            targets.append(target)
 
         slots = mesh.face_materials[tri_face] if mesh.face_materials is not None else np.zeros(len(tris), np.int64)
         if materials:
@@ -486,10 +735,34 @@ class _Writer:
             prim = {"attributes": attrs, "indices": self._accessor(part.astype(dtype), "SCALAR", 34963), "mode": 4}
             if materials:
                 prim["material"] = self._material(materials[int(slot)])
+            if targets:
+                prim["targets"] = targets
             primitives.append(prim)
-        self._arr("meshes").append({"name": mesh.name, "primitives": primitives})
+        out = {"name": mesh.name, "primitives": primitives}
+        if mesh.targets:
+            weights = mesh.target_weights if mesh.target_weights is not None else np.zeros(len(mesh.targets))
+            out["weights"] = [float(w) for w in weights]
+            out["extras"] = {"targetNames": [m.name for m in mesh.targets]}  # Blender's and three.js's names
+        self._arr("meshes").append(out)
         self.meshes[key] = len(self.doc["meshes"]) - 1
         return self.meshes[key]
+
+    def _influences(self, attrs: dict, skin: Skin, source: np.ndarray) -> None:
+        """JOINTS_n and WEIGHTS_n, four influences a set, the strongest first."""
+        weights = np.asarray(skin.weights, np.float64)[source]
+        joints = np.asarray(skin.indices)[source]
+        order = np.argsort(-weights, axis=1, kind="stable")
+        weights, joints = np.take_along_axis(weights, order, 1), np.take_along_axis(joints, order, 1)
+        used = max(1, int((weights > 0).sum(1).max()))
+        width = -(-used // 4) * 4
+        weights = np.pad(weights[:, :used], ((0, 0), (0, width - used)))
+        joints = np.where(weights > 0, np.pad(joints[:, :used], ((0, 0), (0, width - used))), 0)
+        weights = (weights / np.maximum(weights.sum(1, keepdims=True), 1e-12)).astype(np.float32)
+        dtype = np.uint8 if len(skin.joints) <= 256 else np.uint16
+        for k in range(width // 4):
+            attrs[f"JOINTS_{k}"] = self._accessor(np.ascontiguousarray(joints[:, 4 * k:4 * k + 4].astype(dtype)), "VEC4",
+                                                  34962)
+            attrs[f"WEIGHTS_{k}"] = self._accessor(np.ascontiguousarray(weights[:, 4 * k:4 * k + 4]), "VEC4", 34962)
 
     def _material(self, mat: Material) -> int:
         if id(mat) in self.materials:

@@ -7,7 +7,10 @@ UV set, smoothing groups, per-face materials, the object's matrix) and the mater
 self-illumination maps). When the file has a keyframer section, it gives the hierarchy,
 pivots, dummy groups and instances, and animated objects are posed at their first frame,
 as Blender and Assimp show them; without one, every object is a root in the pose it was
-saved in. Lights, cameras and the animation itself are skipped.
+saved in. The objects' animation comes along as node channels (30 frames a second, 3ds Max's
+default): rotation keys turn from the key before (the first is absolute), and keys are blended
+in a straight line, which is how 3ds Max's own poses, saved part way through an animation, come
+out; the spline terms keys carry are read past. Lights and cameras' own animation are skipped.
 
 The format's limits shape the writer: a mesh is triangles with at most 65,535 vertices and
 65,535 faces, one UV per vertex, and normals only as smoothing groups. Bigger meshes are
@@ -32,8 +35,24 @@ from pathlib import Path
 import numpy as np
 
 from .fbx import _EXT, TextureFinder
-from .geometry import scaling, transform_points, translation, unique_rows
-from .scene import DAMAGED, Image, Material, Mesh, MeshportError, Node, Scene
+from .geometry import (
+    decompose_many,
+    scaling,
+    transform_points,
+    translation,
+    unique_rows,
+)
+from .scene import (
+    DAMAGED,
+    Animation,
+    Channel,
+    Image,
+    Material,
+    Mesh,
+    MeshportError,
+    Node,
+    Scene,
+)
 
 MAIN, VERSION, EDIT, MESH_VERSION, MASTER_SCALE = 0x4D4D, 0x0002, 0x3D3D, 0x3D3E, 0x0100
 OBJECT, TRIMESH = 0x4000, 0x4100
@@ -50,6 +69,7 @@ KF_SEGMENT, KF_CURRENT = 0xB008, 0xB009
 NODE_HDR, INSTANCE_NAME, PIVOT, NODE_ID = 0xB010, 0xB011, 0xB013, 0xB030
 POS_TRACK, ROT_TRACK, SCL_TRACK, ROLL_TRACK = 0xB020, 0xB021, 0xB022, 0xB024
 DUMMY = "$$$DUMMY"  # the object name of a keyframer node that only groups others
+FPS = 30.0  # 3DS files don't say; 3ds Max's default
 
 LIMIT = 65535  # vertices and faces per object: 3DS counts and indexes them with 16 bits
 _OBJECT_NAME, _MATERIAL_NAME = 10, 16
@@ -119,6 +139,7 @@ class _Reader:
         self.cameras: dict[str, tuple] = {}  # name -> (position, target, roll in degrees)
         self.segment_start: int | None = None
         self.saved_frame: int | None = None  # the frame the file was saved on, in ticks
+        self.moving: list[tuple[Node, dict, bool]] = []  # keyframer nodes, and whether the pivot moved their mesh
 
     def scene(self) -> Scene:
         data = self.data
@@ -143,6 +164,14 @@ class _Reader:
         scene = Scene(self._hierarchy(keys, objects, loose, exact) if keys else loose)
         if not scene.meshes:
             raise MeshportError("No 3D geometry found in this file")
+        in_scene = {id(n) for n, _ in scene.walk()}
+        roots = {id(n) for n in scene.roots}
+        channels = []
+        for node, key, shifted in self.moving:
+            if id(node) in in_scene:
+                channels += _channels(node, key, id(node) in roots, shifted)
+        if channels:
+            scene.animations = [Animation("animation", channels)]
         return scene
 
     # ---- objects
@@ -179,7 +208,8 @@ class _Reader:
                 continue
             kind = {OBJECT_NODE: "object", CAMERA_NODE: "camera", TARGET_NODE: "target"}.get(cid, "other")
             node = {"kind": kind, "id": len(out), "name": "", "parent": -1, "instance": "",
-                    "pivot": (0.0, 0.0, 0.0), POS_TRACK: None, ROT_TRACK: None, SCL_TRACK: None, ROLL_TRACK: None}
+                    "pivot": (0.0, 0.0, 0.0), POS_TRACK: None, ROT_TRACK: None, SCL_TRACK: None, ROLL_TRACK: None,
+                    "tracks": {}}
             for sub, ss, se in _chunks(data, s, e):
                 if sub == NODE_ID and se - ss >= 2:
                     node["id"] = struct.unpack_from("<h", data, ss)[0]
@@ -192,27 +222,39 @@ class _Reader:
                 elif sub == PIVOT and se - ss >= 12:
                     node["pivot"] = struct.unpack_from("<3f", data, ss)
                 elif sub in (POS_TRACK, ROT_TRACK, SCL_TRACK, ROLL_TRACK):
-                    node[sub] = self._first_key(ss, se, {ROT_TRACK: 4, ROLL_TRACK: 1}.get(sub, 3))
+                    track = self._track(ss, se, {ROT_TRACK: 4, ROLL_TRACK: 1}.get(sub, 3))
+                    node[sub] = track[0][1] if track else None
+                    node["tracks"][sub] = track
             out.append(node)
         return out
 
-    def _first_key(self, start: int, end: int, width: int) -> tuple | None:
-        """A track's first key. A track is flags, 8 unused bytes and a key count; each key
-        is a frame number, flags saying how many spline terms follow, those terms and the value."""
+    def _track(self, start: int, end: int, width: int) -> list[tuple[int, tuple]]:
+        """A track's keys, (frame, value) in the order stored. A track is flags, 8 unused bytes
+        and a key count; each key is a frame number, flags saying how many spline terms follow,
+        those terms and the value. A key whose value isn't a number ends the track there (its
+        first key being kept, if that one is)."""
         data = self.data
         if start + 14 > end:
             raise MeshportError("This 3DS file is damaged (an animation track is cut short)")
-        if struct.unpack_from("<I", data, start + 10)[0] == 0:
-            return None
-        pos = start + 14
-        if pos + 6 > end:
-            raise MeshportError("This 3DS file is damaged (an animation key is cut short)")
-        flags = struct.unpack_from("<H", data, pos + 4)[0]
-        pos += 6 + 4 * (flags & 0x1F).bit_count()  # one float per spline term present
-        if pos + 4 * width > end:
-            raise MeshportError("This 3DS file is damaged (an animation key is cut short)")
-        value = struct.unpack_from(f"<{width}f", data, pos)
-        return value if all(np.isfinite(value)) else None
+        count = struct.unpack_from("<I", data, start + 10)[0]
+        pos, keys = start + 14, []
+        for _ in range(count):
+            if pos + 6 > end:
+                if keys:
+                    break  # a cut short track keeps the keys before the cut
+                raise MeshportError("This 3DS file is damaged (an animation key is cut short)")
+            frame, flags = struct.unpack_from("<IH", data, pos)
+            pos += 6 + 4 * (flags & 0x1F).bit_count()  # one float per spline term present
+            if pos + 4 * width > end:
+                if keys:
+                    break
+                raise MeshportError("This 3DS file is damaged (an animation key is cut short)")
+            value = struct.unpack_from(f"<{width}f", data, pos)
+            pos += 4 * width
+            if not all(np.isfinite(value)):
+                break
+            keys.append((frame, value))
+        return keys
 
     def _hierarchy(self, keys: list[dict], objects: dict[str, list[Node]], loose: list[Node],
                    exact: bool) -> list[Node]:
@@ -257,9 +299,11 @@ class _Reader:
                     keep[id(node)] = saved[id(sources[0])]
             elif exact and id(node) in saved:
                 keep[id(node)] = saved[id(node)]
+                self.moving.append((node, key, False))  # its keys still move it on from the saved pose
             if id(node) in keep:
                 node.matrix = _key_matrix(key)  # for now: replaced below, once its parent is placed
             else:
+                self.moving.append((node, key, True))
                 # The mesh is kept relative to its own matrix; the node moves it from its pivot.
                 if any(key["pivot"]):
                     for n in [node, *parts]:
@@ -466,6 +510,80 @@ def _key_matrix(key: dict) -> np.ndarray:
     return m @ scaling(key[SCL_TRACK] or (1.0, 1.0, 1.0))
 
 
+def _turn(angle: float, axis) -> np.ndarray:
+    """A 3DS rotation key's turn (3DS turns the other way round its axis)."""
+    axis = np.array(axis, np.float64)
+    length = np.linalg.norm(axis)
+    if not length:
+        return np.eye(3)
+    x, y, z = axis / length
+    k = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
+    return np.eye(3) - np.sin(angle) * k + (1 - np.cos(angle)) * k @ k
+
+
+def _blend(track: list, frames: np.ndarray, rest) -> np.ndarray:
+    """A position or scale track at each frame: held before the first key and after the last,
+    in a straight line between."""
+    if not track:
+        return np.tile(np.asarray(rest, np.float64), (len(frames), 1))
+    keys = sorted(track, key=lambda k: k[0])
+    at = np.array([k[0] for k in keys], np.float64)
+    vals = np.array([k[1] for k in keys], np.float64)
+    return np.stack([np.interp(frames, at, vals[:, i]) for i in range(vals.shape[1])], 1)
+
+
+def _turns(track: list, frames: np.ndarray) -> np.ndarray:
+    """A rotation track at each frame: each key turns on from the one before (the first is
+    where it starts), and between keys the turn to the next is made a little at a time."""
+    if not track:
+        return np.tile(np.eye(3), (len(frames), 1, 1))
+    keys = sorted(track, key=lambda k: k[0])
+    poses, pose = [], np.eye(3)
+    for i, (_, (angle, *axis)) in enumerate(keys):
+        pose = _turn(angle, axis) if i == 0 else _turn(angle, axis) @ pose
+        poses.append(pose)
+    at = np.array([k[0] for k in keys], np.float64)
+    out = []
+    for f in frames:
+        k = int(np.searchsorted(at, f, side="right")) - 1
+        if k < 0:
+            out.append(poses[0])
+        elif k >= len(keys) - 1 or at[k + 1] == at[k]:
+            out.append(poses[k])
+        else:
+            angle, *axis = keys[k + 1][1]
+            out.append(_turn(angle * (f - at[k]) / (at[k + 1] - at[k]), axis) @ poses[k])
+    return np.array(out)
+
+
+def _channels(node: Node, key: dict, root: bool, shifted: bool = True) -> list[Channel]:
+    """A keyframer node's tracks as channels: posed at every key, and at every frame between
+    while it turns, then split into translation, rotation and scale. A node that kept its saved
+    pose has its mesh where it was saved, not moved by the pivot, so the pivot goes in here."""
+    tracks = key["tracks"]
+    if not any(len(tracks.get(t) or []) > 1 for t in (POS_TRACK, ROT_TRACK, SCL_TRACK)):
+        return []
+    frames = np.unique([k[0] for t in (POS_TRACK, ROT_TRACK, SCL_TRACK) for k in tracks.get(t) or []]).astype(np.float64)
+    if len(tracks.get(ROT_TRACK) or []) > 1 and frames[-1] - frames[0] <= 100_000:
+        frames = np.unique(np.concatenate([frames, np.arange(frames[0], frames[-1] + 1)]))
+    m = np.tile(np.eye(4), (len(frames), 1, 1))
+    m[:, :3, 3] = _blend(tracks.get(POS_TRACK), frames, (0.0, 0.0, 0.0))
+    sizes = np.tile(np.eye(4), (len(frames), 1, 1))
+    sizes[:, [0, 1, 2], [0, 1, 2]] = _blend(tracks.get(SCL_TRACK), frames, (1.0, 1.0, 1.0))
+    turns = np.tile(np.eye(4), (len(frames), 1, 1))
+    turns[:, :3, :3] = _turns(tracks.get(ROT_TRACK), frames)
+    m = m @ turns @ sizes
+    if not shifted and any(key["pivot"]):
+        m = m @ translation(-np.array(key["pivot"], np.float64))
+    if root:
+        m = _Z_UP @ m
+    out = []
+    for name, vals in zip(("translation", "rotation", "scale"), decompose_many(m)):
+        if not np.allclose(vals, vals[0], atol=1e-9):
+            out.append(Channel(node, name, frames / FPS, vals, "LINEAR"))
+    return out
+
+
 def _camera_matrix(key: dict, targets: dict, cameras: dict) -> np.ndarray:
     """A camera node's matrix at its first frame. 3DS cameras aim at a target point; as in
     3ds Max, the camera's local -Z looks at it, +Y is up and the roll turns it about -Z."""
@@ -528,14 +646,15 @@ def _smooth_normals(positions: np.ndarray, tris: np.ndarray, groups: np.ndarray)
 
 
 def write(scene: Scene) -> bytes:
-    """3DS bytes. Textures are referenced by file name; write_file also writes them."""
-    return _Writer(scene).build()
+    """3DS bytes. Textures are referenced by file name; write_file also writes them. Skins and
+    blend shapes are applied where they stand."""
+    return _Writer(scene.deformed()).build()
 
 
 def write_file(scene: Scene, path: str | os.PathLike) -> list[Path]:
     """Write path (.3ds) and the texture files it refers to next to it. Returns every file written."""
     path = Path(path)
-    writer = _Writer(scene)
+    writer = _Writer(scene.deformed())
     data = writer.build()
     written = [path]
     for image, name in writer.image_files():

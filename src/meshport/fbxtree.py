@@ -115,12 +115,15 @@ def _read_binary(data: bytes) -> tuple[int, list[Record]]:
 
 
 def _read_record(data: bytes, pos: int, layout: _Layout):
+    start = pos
     end, count, _, name_len = layout.head.unpack_from(data, pos)
     pos += layout.head.size
     if end == 0:
         return None, pos
     if end > len(data):
         raise ValueError("record runs past the end of the file")
+    if end <= start:  # reading would go back over what it has read, forever
+        raise ValueError("a record ends before it starts")
     name = data[pos:pos + name_len].decode("ascii", "replace")
     pos += name_len
     props = []

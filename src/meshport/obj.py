@@ -18,8 +18,9 @@ from .scene import Image, Material, MeshportError, Scene
 
 def write_file(scene: Scene, path: str | os.PathLike) -> list[Path]:
     """Write path (.obj), plus a .mtl and texture files when there are materials.
-    Returns every file written."""
+    Returns every file written. Skins and blend shapes are applied where they stand."""
     path = Path(path)
+    scene = scene.deformed()
     lines = ["# meshport"]
     mtl_name = f"{path.stem}.mtl"
     materials: dict[int, str] = {}

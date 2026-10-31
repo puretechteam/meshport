@@ -12,15 +12,28 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
-from .scene import Image, Material, Mesh, MeshportError, Node, Scene
+from .scene import (
+    Animation,
+    Channel,
+    Image,
+    Material,
+    Mesh,
+    MeshportError,
+    Morph,
+    Node,
+    Scene,
+    Skin,
+)
 
 FORMATS = {"fbx": "FBX", "glb": "glTF binary", "gltf": "glTF", "3ds": "Autodesk 3DS",
-           "obj": "Wavefront OBJ (write only)"}
+           "usd": "USD", "usda": "USD text", "usdc": "USD binary", "usdz": "USD package", "abc": "Alembic",
+           "blend": "Blender (read only)", "obj": "Wavefront OBJ (write only)"}
+_USD = ("usd", "usda", "usdc", "usdz")
 
-__all__ = ["FORMATS", "Image", "Material", "Mesh", "MeshportError", "Node", "Scene", "__version__", "load",
-           "read", "save", "write"]
+__all__ = ["FORMATS", "Animation", "Channel", "Image", "Material", "Mesh", "MeshportError", "Morph", "Node", "Scene",
+           "Skin", "__version__", "load", "read", "save", "write"]
 
 
 def _module(fmt: str):
@@ -34,6 +47,15 @@ def _module(fmt: str):
     if fmt == "3ds":
         from . import max3ds
         return max3ds
+    if fmt in _USD:
+        from . import usd
+        return usd
+    if fmt == "abc":
+        from . import alembic
+        return alembic
+    if fmt == "blend":
+        from . import blend
+        return blend
     raise MeshportError(f"meshport doesn't handle .{fmt} files (it handles {', '.join(FORMATS)})")
 
 
@@ -44,6 +66,22 @@ def _sniff(data: bytes) -> str | None:
         return "fbx"
     if data[:2] == b"MM" and data[6:8] in (b"\x02\x00", b"==", b"\x00\xb0"):  # then version, editor or keyframer
         return "3ds"
+    if data[:5] == b"Ogawa":
+        return "abc"
+    if data[:7] == b"BLENDER":
+        return "blend"
+    if data[:4] == b"\x28\xb5\x2f\xfd" or data[:2] == b"\x1f\x8b":  # a compressed .blend
+        from .blend import _decompress
+        try:
+            head = _decompress(data[:1 << 16], 16)  # only the start: a gzip file may hold gigabytes
+        except MeshportError:
+            head = None  # (zstd without a decompressor installed, for one: reading it says so)
+        if head is None or head[:7] == b"BLENDER":
+            return "blend"
+    from .usd import detect
+    usd = detect(data)
+    if usd:
+        return usd
     head = data[:4096].lstrip(b"\xef\xbb\xbf \t\r\n")
     if head.startswith(b";") or b"FBXHeaderExtension" in head:
         return "fbx"
@@ -61,12 +99,19 @@ def read(data: bytes, fmt: str | None = None, base_dir: str | os.PathLike | None
 
 
 def write(scene: Scene, fmt: str) -> bytes:
-    """File bytes. A 3DS file only names its textures: save() writes them next to it."""
+    """File bytes. 3DS and USD layers (other than .usdz) only name their textures: save()
+    writes them next to the file."""
     fmt = fmt.lower().lstrip(".")
     if fmt == "obj":
         raise MeshportError("OBJ is a set of files (.obj, .mtl, textures): write it with save()")
+    if fmt == "blend":
+        raise MeshportError("meshport reads .blend files but can't write them")
     mod = _module(fmt)
-    return mod.write(scene, binary=fmt == "glb") if fmt in ("glb", "gltf") else mod.write(scene)
+    if fmt in ("glb", "gltf"):
+        return mod.write(scene, binary=fmt == "glb")
+    if fmt in _USD:
+        return mod.write(scene, "usdc" if fmt == "usd" else fmt)
+    return mod.write(scene)
 
 
 def load(path: str | os.PathLike, fmt: str | None = None) -> Scene:
@@ -78,7 +123,8 @@ def load(path: str | os.PathLike, fmt: str | None = None) -> Scene:
 
 def save(scene: Scene, path: str | os.PathLike, fmt: str | None = None) -> list[Path]:
     """Write a file; the format comes from the extension unless given. Returns every file
-    written (OBJ also writes a .mtl and textures next to it, 3DS its textures)."""
+    written (OBJ also writes a .mtl and textures next to it, 3DS its textures, and USD other
+    than .usdz its textures in a textures folder)."""
     path = Path(path)
     fmt = (fmt or path.suffix).lower().lstrip(".")
     if fmt == "obj":
@@ -87,5 +133,8 @@ def save(scene: Scene, path: str | os.PathLike, fmt: str | None = None) -> list[
     if fmt == "3ds":
         from . import max3ds
         return max3ds.write_file(scene, path)
+    if fmt in _USD:
+        from . import usd
+        return usd.write_file(scene, path, "usdc" if fmt == "usd" else fmt)
     path.write_bytes(write(scene, fmt))
     return [path]

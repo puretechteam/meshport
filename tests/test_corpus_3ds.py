@@ -34,6 +34,16 @@ def _gap(a, b) -> float:
     return max(cKDTree(pb).query(pa)[0].max(), cKDTree(pa).query(pb)[0].max()) / max(np.ptp(pa, 0).max(), 1.0)
 
 
+def _posed(scene, t: float):
+    """The scene with each node's local matrix as its animation has it at time t."""
+    from meshport import Node, Scene
+    anim = scene.animations[0]
+
+    def copy(node):
+        return Node(node.name, anim.local_matrix(node, t), node.mesh, node.materials, [copy(c) for c in node.children])
+    return Scene([copy(r) for r in scene.roots])
+
+
 def _smoothing_by_the_rule(pts, faces, groups):
     """The smoothing-group rule read literally: a corner sums the unit normals of the faces
     around its vertex that share a group bit with its own face; a face in no group is flat."""
@@ -96,11 +106,15 @@ def test_real_3ds_file(path):
     # Saved on its first frame, the file's stored geometry is the pose meshport must give.
     reader = max3ds._Reader(data, None)
     reader.scene()
+    end = min(struct.unpack_from("<I", data, 2)[0], len(data))
+    stored = max3ds.read(max3ds._chunk(max3ds.MAIN, *[data[s - 6:e] for cid, s, e in _chunks(data, 6, end)
+                                                      if cid != max3ds.KFDATA]))
     if reader.saved_frame is not None and reader.saved_frame in (reader.segment_start, 160 * reader.segment_start):
-        end = min(struct.unpack_from("<I", data, 2)[0], len(data))
-        stored = max3ds.read(max3ds._chunk(max3ds.MAIN, *[data[s - 6:e] for cid, s, e in _chunks(data, 6, end)
-                                                          if cid != max3ds.KFDATA]))
         assert _gap(scene, stored) < 1e-5
+    elif reader.saved_frame and scene.animations:
+        # Saved part way through, the stored geometry is the animation's pose on that frame (160 ticks
+        # a frame), as 3ds Max gave it
+        assert _gap(_posed(scene, reader.saved_frame / 160 / max3ds.FPS), stored) < 1e-5
 
     # Normals follow the smoothing groups exactly.
     for pts, faces, groups in _smoothed_meshes(data):

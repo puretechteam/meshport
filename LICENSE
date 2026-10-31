@@ -19,3 +19,25 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---------------------------------------------------------------------------
+
+Third-party notices
+
+meshport contains no code from the projects below. Its USD and Alembic readers
+and writers were written from the file formats as these open-source projects
+read and write them, and were checked against files those projects write.
+Their licenses are noted here for reference.
+
+OpenUSD (Pixar's Universal Scene Description library)
+  https://github.com/PixarAnimationStudios/OpenUSD
+  Copyright 2016 Pixar. Licensed under the Apache License, Version 2.0
+  ("Modified Apache 2.0 License" in the project's LICENSE.txt):
+  https://www.apache.org/licenses/LICENSE-2.0
+
+Alembic
+  https://github.com/alembic/alembic
+  Copyright (c) Sony Pictures Imageworks Inc. and Industrial Light & Magic,
+  a division of Lucasfilm Entertainment Company Ltd. Licensed under the BSD
+  3-Clause License:
+  https://opensource.org/licenses/BSD-3-Clause

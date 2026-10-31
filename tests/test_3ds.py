@@ -387,3 +387,88 @@ def test_objects_are_written_in_world_space_with_identity_matrices(scene):
     assert len(matrices) == 3 and all(np.array_equal(m, np.eye(4)[:3].T) for m in matrices)
     assert max3ds.KFDATA not in {cid for cid, _, _ in _chunks(data, 6, len(data))}
     _same_geometry(scene, max3ds.read(data))
+
+
+# ---- keyframer animation
+
+def _keys(cid: int, keys) -> bytes:
+    """A track with several keys: (frame, value), or (frame, value, {term: float}) with spline terms."""
+    body = struct.pack("<H8xI", 0, len(keys))
+    names = ("tension", "continuity", "bias", "ease_to", "ease_from")
+    for frame, value, *terms in keys:
+        terms = terms[0] if terms else {}
+        body += struct.pack("<IH", frame, sum(1 << i for i, n in enumerate(names) if n in terms))
+        body += b"".join(struct.pack("<f", terms[n]) for n in names if n in terms)
+        body += struct.pack(f"<{len(value)}f", *value)
+    return _chunk(cid, body)
+
+
+def _animated_file(tracks: list[bytes], child_tracks: list[bytes] | None = None, pivot=None) -> bytes:
+    parts = [_chunk(max3ds.NODE_ID, struct.pack("<h", 0)), _chunk(max3ds.NODE_HDR, b"box\0", struct.pack("<HHh", 0, 0, -1))]
+    if pivot:
+        parts.append(_chunk(max3ds.PIVOT, struct.pack("<3f", *pivot)))
+    nodes = [_chunk(max3ds.KF_SEGMENT, struct.pack("<II", 0, 30)), _chunk(max3ds.OBJECT_NODE, *parts, *tracks)]
+    objects = [_mesh_object("box", compose((0, 0, 0)))]
+    if child_tracks is not None:
+        objects.append(_mesh_object("lid", compose((0, 0, 0))))
+        nodes.append(_chunk(max3ds.OBJECT_NODE, _chunk(max3ds.NODE_ID, struct.pack("<h", 1)),
+                            _chunk(max3ds.NODE_HDR, b"lid\0", struct.pack("<HHh", 0, 0, 0)), *child_tracks))
+    return _keyed_file(objects, nodes)
+
+
+def _local_at(scene: Scene, name: str, frame: float) -> np.ndarray:
+    """A node's local matrix at a frame, back in 3DS's Z-up axes for roots."""
+    node = nodes_by_name(scene)[name][0]
+    m = scene.animations[0].local_matrix(node, frame / max3ds.FPS)
+    return np.linalg.inv(max3ds._Z_UP) @ m if node in scene.roots else m
+
+
+def test_positions_and_scales_blend_in_a_straight_line_between_keys():
+    data = _animated_file([_keys(max3ds.POS_TRACK, [(0, (0, 0, 0)), (10, (10, 0, 0), {"tension": 0.5, "bias": 0.7}),
+                                                    (30, (10, 20, 0))]),
+                           _keys(max3ds.SCL_TRACK, [(0, (1, 1, 1)), (30, (4, 1, 1))])])
+    scene = max3ds.read(data)
+    for frame, pos, sx in ((5, (5, 0, 0), 1.5), (20, (10, 10, 0), 3.0), (40, (10, 20, 0), 4.0), (-3, (0, 0, 0), 1.0)):
+        m = _local_at(scene, "box", frame)
+        np.testing.assert_allclose(m[:3, 3], pos, atol=1e-5)  # spline terms are read past: still straight
+        assert np.linalg.norm(m[:3, 0]) == pytest.approx(sx)
+
+
+def test_rotation_keys_turn_on_from_the_key_before():
+    # three keys a quarter turn each about Z (3DS turns the other way: -90 degrees is +90 here)
+    quarter = (-np.pi / 2, 0, 0, 1)
+    data = _animated_file([_keys(max3ds.ROT_TRACK, [(0, (0, 0, 0, 1)), (10, quarter), (20, quarter)])])
+    scene = max3ds.read(data)
+    x = np.array([1.0, 0, 0])
+    np.testing.assert_allclose(_local_at(scene, "box", 10)[:3, :3] @ x, [0, 1, 0], atol=1e-6)
+    np.testing.assert_allclose(_local_at(scene, "box", 20)[:3, :3] @ x, [-1, 0, 0], atol=1e-6)  # half a turn
+    half = np.sqrt(0.5)
+    np.testing.assert_allclose(_local_at(scene, "box", 15)[:3, :3] @ x, [-half, half, 0], atol=1e-6)
+
+
+def test_a_turn_of_more_than_half_a_turn_between_keys():
+    data = _animated_file([_keys(max3ds.ROT_TRACK, [(0, (0, 0, 0, 1)), (30, (-1.5 * np.pi, 0, 0, 1))])])
+    m = _local_at(max3ds.read(data), "box", 20)  # two thirds of 270 degrees: 180
+    np.testing.assert_allclose(m[:3, :3] @ [1, 0, 0], [-1, 0, 0], atol=1e-6)
+
+
+def test_children_pivots_and_the_first_frame():
+    data = _animated_file([_keys(max3ds.POS_TRACK, [(0, (5, 0, 0)), (30, (5, 0, 9))])],
+                          [_keys(max3ds.POS_TRACK, [(0, (0, 1, 0)), (30, (0, 3, 0))])], pivot=(1, 0, 0))
+    scene = max3ds.read(data)
+    assert {c.node.name for c in scene.animations[0].channels} == {"box", "lid"}
+    still = {n.name: w for n, w in scene.walk()}
+    first = {n.name: w for n, w in scene.walk_at(0)}
+    assert all(np.allclose(still[k], first[k]) for k in still)  # frame 0 is the pose without animation
+    world = {n.name: w for n, w in scene.walk_at(1.0)}  # frame 30
+    np.testing.assert_allclose(np.linalg.inv(max3ds._Z_UP) @ world["lid"] @ [0, 0, 0, 1], [5, 3, 9, 1], atol=1e-5)
+
+
+def test_a_cut_short_or_broken_track_keeps_its_good_keys():
+    track = _keys(max3ds.POS_TRACK, [(0, (0, 0, 0)), (10, (10, 0, 0)), (20, (float("nan"), 0, 0))])
+    scene = max3ds.read(_animated_file([track]))
+    (c,) = scene.animations[0].channels
+    assert list(c.times * max3ds.FPS) == [0, 10]
+    cut = track[:-8]
+    cut = struct.pack("<HI", max3ds.POS_TRACK, len(cut)) + cut[6:]
+    assert len(max3ds.read(_animated_file([cut])).animations[0].channels) == 1
