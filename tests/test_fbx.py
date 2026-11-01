@@ -311,3 +311,21 @@ def test_animation_only_file_says_so(scene):
     objects.children = [r for r in objects.children if r.name == "Model" and "Null" in r.props]
     with pytest.raises(MeshportError, match="No 3D geometry"):
         fbx.read(write_binary(records))
+
+
+@pytest.mark.parametrize("ext", ["glb", "gltf", "usd", "usda", "usdz", "obj", "3ds", "abc"])
+def test_ascii_is_refused_for_every_format_but_fbx(scene, tmp_path, ext):
+    # it used to be silently ignored for everything but Alembic
+    with pytest.raises(meshport.MeshportError, match="Only FBX can be written as ASCII"):
+        meshport.save(scene, tmp_path / f"out.{ext}", ascii=True)
+    assert not (tmp_path / f"out.{ext}").exists()
+    if ext not in ("obj", "3ds"):
+        with pytest.raises(meshport.MeshportError, match="Only FBX can be written as ASCII"):
+            meshport.write(scene, ext, ascii=True)
+
+
+def test_ascii_on_the_command_line_is_refused_for_glb(scene, tmp_path, capsys):
+    from meshport.__main__ import main
+    meshport.save(scene, tmp_path / "in.glb")
+    assert main([str(tmp_path / "in.glb"), str(tmp_path / "out.glb"), "--ascii"]) != 0
+    assert not (tmp_path / "out.glb").exists()

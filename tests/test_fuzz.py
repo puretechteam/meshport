@@ -1,4 +1,4 @@
-"""Fuzzed and cut-short USD, Alembic and .blend files: reading one may only raise MeshportError, and
+"""Fuzzed and cut-short USD, Alembic, OBJ and .blend files: reading one may only raise MeshportError, and
 each format's whole run has to finish in time (each runs in its own Python, so a hang fails the test
 instead of stopping the run)."""
 
@@ -36,6 +36,11 @@ def scene():
 
 if kind in ("usda", "usdc", "usdz", "abc"):
     data, fmt = meshport.write(scene(), kind), kind
+elif kind == "obj":
+    import pathlib, tempfile
+    with tempfile.TemporaryDirectory() as folder:
+        meshport.save(scene(), pathlib.Path(folder) / "f.obj")
+        data, fmt = (pathlib.Path(folder) / "f.obj").read_bytes(), "obj"
 else:  # a .blend fixture, uncompressed, so the bytes reached are the file's own
     from meshport.blend import _decompress
     data, fmt = _decompress(open(f"data/{kind}.blend", "rb").read()), "blend"
@@ -77,14 +82,14 @@ def _run(code: str, kind: str, rounds: int) -> tuple[int, str]:
 
 
 @pytest.mark.parametrize("kind, rounds", [("usda", 300), ("usdc", 300), ("usdz", 200), ("abc", 300),
-                                          ("scene", 150), ("skin", 150)])
+                                          ("scene", 150), ("skin", 150), ("obj", 300)])
 def test_fuzzed_files_raise_only_meshport_error(kind, rounds):
     code, out = _run(_FUZZ, kind, rounds)
     assert code == 0, out
     assert "BAD" not in out, out
 
 
-@pytest.mark.parametrize("kind", ["usda", "usdc", "usdz", "abc", "scene"])
+@pytest.mark.parametrize("kind", ["usda", "usdc", "usdz", "abc", "scene", "obj"])
 def test_files_cut_short_raise_only_meshport_error(kind):
     code = _FUZZ.split("rng = random.Random(kind)")[0] + r"""
 bad = []

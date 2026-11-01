@@ -125,7 +125,9 @@ def slerp(a: np.ndarray, b: np.ndarray, u: np.ndarray) -> np.ndarray:
     wa = np.where(near, 1 - u, np.sin((1 - u) * theta) / safe)
     wb = np.where(near, u, np.sin(u * theta) / safe)
     q = wa * a + wb * b
-    return q / np.linalg.norm(q, axis=-1, keepdims=True)
+    norm = np.linalg.norm(q, axis=-1, keepdims=True)
+    # all-zero keys (a damaged file) give no rotation instead of 0/0
+    return np.where(norm > 0, q / np.where(norm > 0, norm, 1.0), (0.0, 0.0, 0.0, 1.0))
 
 
 # ---- many transforms at once (animation)

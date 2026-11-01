@@ -31,7 +31,15 @@ from .fbxanim import (
     euler_degrees,
     time_mode,
 )
-from .fbxtree import CREATION_TIME, FILE_ID, Record, decode_content, parse, write_binary
+from .fbxtree import (
+    CREATION_TIME,
+    FILE_ID,
+    Record,
+    decode_content,
+    parse,
+    write_ascii,
+    write_binary,
+)
 from .geometry import (
     EULER_ORDERS,
     compose,
@@ -860,13 +868,14 @@ def _flip_winding(sizes, corners, normals, colors, uvs):
 # ============================================================================ writing
 
 
-def write(scene: Scene) -> bytes:
-    """The scene as binary FBX 7.4 bytes, textures embedded."""
-    return write_binary(_Writer(scene).records())
+def write(scene: Scene, ascii: bool = False) -> bytes:
+    """The scene as FBX 7.4 bytes, binary or ASCII, textures embedded."""
+    records = _Writer(scene).records()
+    return write_ascii(records).encode("utf-8") if ascii else write_binary(records)
 
 
-def write_file(scene: Scene, path: str | os.PathLike) -> None:
-    Path(path).write_bytes(write(scene))
+def write_file(scene: Scene, path: str | os.PathLike, ascii: bool = False) -> None:
+    Path(path).write_bytes(write(scene, ascii))
 
 
 def _p(name: str, type_: str, label: str, flags: str, *values) -> Record:

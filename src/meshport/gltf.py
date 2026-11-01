@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 import os
 import struct
 from pathlib import Path
@@ -29,6 +30,7 @@ from .scene import (
     Animation,
     Channel,
     Image,
+    Light,
     Material,
     Mesh,
     MeshportError,
@@ -93,6 +95,16 @@ def _split_glb(data: bytes) -> tuple[dict, bytes | None]:
         raise MeshportError("This GLB file has no JSON chunk")
     return doc, binary
 
+
+
+def _whole(values: np.ndarray, what: str) -> np.ndarray:
+    """values as int64: glTF stores indices as integers, but a damaged file can give float ones
+    (NaN, huge, or fractional), which numpy would cast with a warning into nonsense."""
+    if values.dtype.kind == "f":
+        ok = np.isfinite(values) & (np.abs(values) < 2.0 ** 53)
+        if not ok.all() or (values != np.floor(values)).any():
+            raise MeshportError(f"This glTF file is damaged ({what} aren't whole numbers)")
+    return values.astype(np.int64)
 
 class _Reader:
     def __init__(self, doc: dict, binary: bytes | None, base_dir: Path | None):
@@ -170,7 +182,8 @@ class _Reader:
                 out = np.ascontiguousarray(rows).view(dtype).reshape(count, width)
             else:
                 out = np.frombuffer(buf, dtype, count=count * width, offset=offset).reshape(count, width)
-            out = out.astype(np.float64) if dtype.kind == "f" else out.copy()
+            with np.errstate(invalid="ignore"):  # a signalling NaN in the file becomes a quiet one
+                out = out.astype(np.float64) if dtype.kind == "f" else out.copy()
         else:
             self._spend(count * width)
             out = np.zeros((count, width), np.float64 if dtype.kind == "f" else dtype)
@@ -184,7 +197,8 @@ class _Reader:
             vals = np.frombuffer(buf, dtype, count=sparse["count"] * width,
                                  offset=off + val_info.get("byteOffset", 0)).reshape(-1, width)
             out = out.astype(np.float64) if dtype.kind == "f" else out
-            out[idx.astype(np.int64)] = vals
+            with np.errstate(invalid="ignore"):
+                out[_whole(idx, "a sparse accessor's indices")] = vals
         if acc.get("normalized") and dtype.kind in "iu":
             info = np.iinfo(dtype)
             out = np.maximum(out.astype(np.float64) / info.max, -1.0)
@@ -278,8 +292,14 @@ class _Reader:
         if "matrix" in data:
             matrix = np.array(data["matrix"], np.float64).reshape(4, 4).T
         else:
-            matrix = translation(data.get("translation", (0, 0, 0))) @ quaternion(data.get("rotation", (0, 0, 0, 1))) \
-                @ scaling(data.get("scale", (1, 1, 1)))
+            trs = [np.array(data.get(k, d), np.float64) for k, d in
+                   (("translation", (0, 0, 0)), ("rotation", (0, 0, 0, 1)), ("scale", (1, 1, 1)))]
+            if not all(np.isfinite(v).all() for v in trs):
+                raise MeshportError("This glTF file is damaged (a node's transform isn't a number)")
+            with np.errstate(over="ignore", invalid="ignore"):
+                matrix = translation(trs[0]) @ quaternion(trs[1]) @ scaling(trs[2])
+        if not np.isfinite(matrix).all():
+            raise MeshportError("This glTF file is damaged (a node's transform isn't a number)")
         node = Node(data.get("name", f"node{i}"), matrix)
         self._nodes.setdefault(i, node)
         if "mesh" in data:
@@ -291,8 +311,33 @@ class _Reader:
                     node.mesh.target_weights = np.array(weights, np.float64)
                 if "skin" in data:
                     self._skinned.append((node, data["skin"], data["mesh"]))
+        light = (data.get("extensions") or {}).get("KHR_lights_punctual")
+        if isinstance(light, dict) and isinstance(light.get("light"), int):
+            node.light = self._light(light["light"])
         node.children = [self._node(c, built, path | {i}) for c in data.get("children", [])]
         return node
+
+    def _light(self, i: int) -> Light | None:
+        """A light from KHR_lights_punctual, or None if it isn't there or is damaged."""
+        lights = ((self.doc.get("extensions") or {}).get("KHR_lights_punctual") or {}).get("lights")
+        if not isinstance(lights, list) or not 0 <= i < len(lights) or not isinstance(lights[i], dict):
+            return None
+        d = lights[i]
+        kind = d.get("type")
+        if kind not in ("point", "spot", "directional"):
+            return None
+        try:
+            color = tuple(float(c) for c in d.get("color", (1, 1, 1)))[:3]
+            light = Light(str(d.get("name", f"light{i}")), kind, color if len(color) == 3 else (1.0, 1.0, 1.0),
+                          float(d.get("intensity", 1.0)))
+            if d.get("range") is not None and kind != "directional":
+                light.range = float(d["range"])
+            spot = d.get("spot") or {}
+            light.inner_cone = float(spot.get("innerConeAngle", 0.0))
+            light.outer_cone = float(spot.get("outerConeAngle", math.pi / 4))
+        except (TypeError, ValueError):
+            return None
+        return light
 
     def _animation(self, k: int, data: dict) -> Animation | None:
         """An animation's channels. A channel that's damaged, or moves something else (a node that
@@ -342,8 +387,10 @@ class _Reader:
                 continue  # points and lines carry no surface
             attrs = prim["attributes"]
             pos = self.accessor(attrs["POSITION"]).astype(np.float64)
+            if not np.isfinite(pos).all():
+                raise MeshportError("This glTF file is damaged (a position isn't a number)")
             pos_key = attrs["POSITION"]
-            idx = self.accessor(prim["indices"]).ravel().astype(np.int64) if "indices" in prim \
+            idx = _whole(self.accessor(prim["indices"]).ravel(), "a mesh's indices") if "indices" in prim \
                 else np.arange(len(pos), dtype=np.int64)
             tris = _to_triangles(idx, mode)
             if not len(tris):
@@ -398,7 +445,7 @@ class _Reader:
             j, w = self.accessor(attrs[f"JOINTS_{k}"]), self.accessor(attrs[f"WEIGHTS_{k}"])
             if len(j) != count or j.shape != w.shape:
                 return None
-            joints.append(j.astype(np.int64))
+            joints.append(_whole(j, "a skin's joints"))
             weights.append(w.astype(np.float64))
             k += 1
         return (np.hstack(joints), np.hstack(weights)) if joints else None
@@ -664,10 +711,27 @@ class _Writer:
                 out["mesh"] = m
                 if skin is not None:
                     self.pending.append((out, skin))
+        if node.light is not None:
+            out["extensions"] = {"KHR_lights_punctual": {"light": self._light(node.light)}}
         kids = [k for k in (self._node(c) for c in node.children) if k is not None]
         if kids:
             out["children"] = kids
         return idx
+
+    def _light(self, light: Light) -> int:
+        lights = self.doc.setdefault("extensions", {}).setdefault("KHR_lights_punctual", {"lights": []})["lights"]
+        if "KHR_lights_punctual" not in self.doc.setdefault("extensionsUsed", []):
+            self.doc["extensionsUsed"].append("KHR_lights_punctual")
+        out = {"name": light.name, "type": light.kind, "color": [float(c) for c in light.color],
+               "intensity": float(light.intensity)}
+        if light.range is not None and light.kind != "directional" and light.range > 0:
+            out["range"] = float(light.range)
+        if light.kind == "spot":
+            outer = min(max(float(light.outer_cone), 1e-6), math.pi / 2)
+            out["spot"] = {"innerConeAngle": min(max(float(light.inner_cone), 0.0), outer * (1 - 1e-6)),
+                           "outerConeAngle": outer}
+        lights.append(out)
+        return len(lights) - 1
 
     def _mesh(self, mesh: Mesh, materials: list[Material], skin: Skin | None = None) -> int | None:
         key = (id(mesh), tuple(id(m) for m in materials), id(skin))

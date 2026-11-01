@@ -13,3 +13,5 @@ dist/
 *.pem
 .DS_Store
 .idea/
+*.blend1
+scratch/

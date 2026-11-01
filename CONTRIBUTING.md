@@ -17,7 +17,7 @@ python -m venv .venv
 .venv\Scripts\ruff check .
 ```
 
-Tests that need Blender, Unity or a folder of real files skip when those aren't there. GitHub Actions runs the tests (Python 3.10 and 3.13) and `ruff check` on every pull request.
+Tests that need Blender, Unity or a folder of real files skip when those aren't there. GitHub Actions runs the tests (Python 3.10 and 3.13, on Windows and Ubuntu) and `ruff check` on every pull request.
 
 - **Write from the format's specification**, never from GPL code (Blender's importers, for example), so meshport stays MIT.
 - **New format:** one reader and one writer that go through `Scene` (see `scene.py`), plus round-trip and damaged-file tests in the style of `tests/test_damaged.py`.

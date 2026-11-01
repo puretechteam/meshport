@@ -1,6 +1,6 @@
 # meshport
 
-Read and write FBX, glTF, 3DS, USD and Alembic, and read Blender's .blend files, in pure Python. No FBX SDK, no 3D app, no compiled code: just NumPy.
+Read and write FBX, glTF, 3DS, USD, Alembic and OBJ, and read Blender's .blend files, in pure Python. No FBX SDK, no 3D app, no compiled code: just NumPy.
 
 What's new: see the [changelog](CHANGELOG.md).
 
@@ -28,7 +28,7 @@ Here is how they compare on the same **2,079 real-world FBX files** from game as
 
 | | **meshport** | Blender 5.1 | ufbx 0.0.5 | assimp-py 1.2.0 |
 |---|---|---|---|---|
-| Install size | **610 KB** ⁴ | 963 MB | 911 KB | 5.1 MB |
+| Install size | **660 KB** ⁴ | 963 MB | 911 KB | 5.1 MB |
 | Reads FBX | ✓ 6.x and 7.x, binary and ASCII | binary 7.x only | ✓ | ✓ |
 | Writes FBX | ✓ | ✓ | – | – |
 | Converts to glTF | ✓ | ✓ | – | – |
@@ -70,11 +70,11 @@ The asset-pack files themselves aren't included here because of their licenses.
 
 ## USD, Alembic and .blend
 
-The other formats 3D tools trade in. Until now, reading them from Python meant installing Blender (1.01 GB) or, for USD only, Pixar's own library (49 MB). meshport handles all three in 610 KB, the whole package included (curves, text, metaballs and modifiers among it).
+The other formats 3D tools trade in. Until now, reading them from Python meant installing Blender (1.01 GB) or, for USD only, Pixar's own library (49 MB). meshport handles all three in 660 KB, the whole package included (curves, text, metaballs and modifiers among it).
 
 | | **meshport** | Blender 5.1 | Pixar's USD (usd-core 26.11) |
 |---|---|---|---|
-| Install size | **610 KB** (everything) | 1.01 GB | 49 MB |
+| Install size | **660 KB** (everything) | 1.01 GB | 49 MB |
 | USD: `.usda`, `.usdc`, `.usdz` | ✓ read and write | ✓ | ✓ |
 | Alembic `.abc` | ✓ read and write | ✓ | – |
 | `.blend` | ✓ read | ✓ | – |
@@ -93,18 +93,18 @@ The other formats 3D tools trade in. Until now, reading them from Python meant i
 
 **Modifiers** that are on in Blender's viewport are applied in order, as Blender shows them (`blend.read(..., modifiers=False)` leaves them off, as Blender's glTF export does by default). Six are covered, and others are skipped while the rest of the stack still applies:
 
-- **Triangulate**, **Weld** (All and Connected), **Mirror** (any axes, merging, bisecting, a mirror object, UV flips and offsets) and **Array** (fixed count or fit length; relative, constant and object offsets; merging, also of the last copy with the first; UV offsets) give the same points as Blender, to float precision.
+- **Triangulate**, **Weld** (All and Connected), **Mirror** (any axes, merging, bisecting, a mirror object, UV flips and offsets) and **Array** (fixed count or fit length; relative, constant and object offsets; merging, also of the last copy with the first; UV offsets; start and end caps, merged with the ends too) give the same points as Blender, to float precision.
 - **Solidify** (simple mode, even thickness, rims, flipped normals, rim only, material offsets) gives the same points too. Complex mode is approximated by simple mode with even thickness.
-- **Subdivision Surface** (Catmull-Clark or simple, at the viewport level) puts points on the exact limit surface, which is where Blender puts them up to its Quality setting (3 by default). Past that, Blender approximates near points where three or five faces meet, so at level 6 the two differ by up to 0.3% of the model's size. Boundaries follow the Boundary Smooth setting; UVs are interpolated linearly and edge creases are ignored.
-- Not applied: Array caps and fit-to-curve, vertex groups, and every other modifier (Bevel, Boolean, Geometry Nodes, ...).
+- **Subdivision Surface** (Catmull-Clark or simple, at the viewport level) puts points on the exact limit surface, which is where Blender puts them up to its Quality setting (3 by default). Past that, Blender approximates near points where three or five faces meet, so at level 6 the two differ by up to 0.3% of the model's size. Boundaries follow the Boundary Smooth setting. UVs are smoothed as Blender smooths them (Keep Boundaries, the default, as well as None, Keep Corners and All; the Junctions variants are taken as Keep Corners). Edge and vertex creases (in files from Blender 4.0 on, when the modifier uses them) are semi-sharp creases, as in OpenSubdiv: creases of 1.0, 0.5 and 0.3 match Blender's points exactly; a 0.7 crease beside a creased corner, three levels down, comes out up to 6% of the object's size sharper. Creases are kept only when the Subdivision Surface comes before any modifier that rebuilds the mesh.
+- Not applied: Array's fit-to-curve, vertex groups, and every other modifier (Bevel, Boolean, Geometry Nodes, ...).
 
 **Curves, text and metaballs** become meshes the way Blender's viewport shows them:
 
-- **Curves:** Bezier, poly and NURBS splines (uniform, endpoint and Bezier knots) at their resolution, with a round bevel, an extrusion or both, fill modes, fill caps, per-point radius and tilt, and minimum-twist or Z-up frames. 2D curves are filled, with curves inside others cut out as holes. Every curve in the test file gives Blender's points to float precision, except an open NURBS curve with an extrusion, whose frames start about 3° apart from Blender's. Not applied: bevel and taper objects, custom bevel profiles, the Tangent twist (treated as Minimum), bevel start and end, path offset and text on a curve. NURBS surfaces are skipped.
+- **Curves:** Bezier, poly and NURBS splines (uniform, endpoint and Bezier knots) at their resolution, with a round bevel, an extrusion or both, fill modes, fill caps, per-point radius and tilt, and minimum-twist or Z-up frames. 2D curves are filled, with curves inside others cut out as holes. Every curve in the test file gives Blender's points to float precision, except an open NURBS curve with an extrusion, whose frames start about 3° apart from Blender's. Closed 3D curves with minimum twist come out turned a constant angle about the curve from Blender's (0.2° to 57° on six probe curves), since Blender starts their frames differently. Not applied: bevel and taper objects, custom bevel profiles, the Tangent twist (treated as Minimum), bevel start and end, path offset and text on a curve. NURBS surfaces are skipped.
 - **Text:** laid out as Blender does (character, word and line spacing, alignment, offsets, shear), in the font packed in the file, next to it or installed on the system, which gives Blender's points to float precision. Blender's built-in font isn't in the file, so meshport uses a similar installed font (Inter, Arial, Liberation Sans, Helvetica, DejaVu Sans or Segoe UI), scaled so capitals come out as tall as Blender's; widths differ by a few percent. Text boxes, small caps, underlines and kerning are left out.
 - **Metaballs:** balls, capsules, planes, ellipsoids and cubes, negative ones included, joined by family (`Mball`, `Mball.001`, ...) as in Blender, at the viewport resolution. meshport finds the same surface, with its own points: measured against a fine reference, its mesh is as close to the true surface as Blender's (8.6 cm for both at Blender's default 0.4 m resolution).
 
-**What USD and Alembic reading leave out.** Curves and points, and animated points (those open at their first sample; animated transforms, USD skeletons and blend shapes come along, see [Animation](#what-it-does)). USD composition covers sublayers, inherits, variants, references, payloads and specializes in USD's strength order, and point instancers become one node per instance sharing the prototype's meshes. Alembic files from before 2013 (HDF5) are refused with a clear error.
+**What USD and Alembic reading leave out.** Curves and points (animated transforms, USD skeletons, blend shapes and animated points come along, see [Animation](#what-it-does)). USD composition covers sublayers, inherits, variants, references, payloads and specializes in USD's strength order, and point instancers become one node per instance sharing the prototype's meshes. Alembic files from before 2013 (HDF5) are refused with a clear error.
 
 ## Where it came from
 
@@ -144,13 +144,13 @@ formats and the others got faster, by 1.8 to 5.5 times, in full app runs on this
 | Format | Read | Write |
 |---|---|---|
 | FBX binary, 6.x and 7.x (2006 onward, either byte order) | ✓ | ✓ (7.4, the version every importer accepts) |
-| FBX ASCII, 6.x and 7.x | ✓ | – |
+| FBX ASCII, 6.x and 7.x | ✓ | ✓ (7.4: `meshport --ascii`, or `save(..., ascii=True)`) |
 | glTF 2.0 (`.gltf`, `.glb`) | ✓ | ✓ (everything embedded in one file) |
 | Autodesk 3DS (`.3ds`) | ✓ | ✓ (with texture files; big meshes split to fit the format) |
 | USD (`.usda`, `.usdc`, `.usd`, `.usdz`) | ✓ (with composition: references, payloads, sublayers, variants) | ✓ (textures inside `.usdz`, or in a `textures` folder next to the others) |
 | Alembic (`.abc`, the Ogawa kind written since 2013) | ✓ | ✓ |
 | Blender (`.blend`, 2.8 onward) | ✓ | – |
-| Wavefront OBJ | – | ✓ (with .mtl and texture files) |
+| Wavefront OBJ | ✓ (with its .mtl files and textures) | ✓ (with .mtl and texture files) |
 
 What comes across in both directions:
 
@@ -165,10 +165,10 @@ What comes across in both directions:
 - glTF keeps all three of its interpolations: step, linear (rotations slerped) and cubic splines.
 - FBX curves come in every kind FBX has: constant (both kinds), linear and cubic (with weighted handles too). FBX rotations are euler angles inside the model's pivots and pre/post rotation, so each model is posed at every key and every frame between (where its curves turn), then split into translation, rotation and scale. Only 7.x animation stacks are read, and where several layers animate one property, the first layer's curves are used.
 - Writing FBX, rotations become euler curves that turn continuously, keyed at every frame of the animation's frame rate (the rate its keys sit on, or 30 frames per second); steps are held frame by frame too, since Blender blends FBX's constant keys. Translation and scale that are already linear keep their own keys.
-- USD: every xform op's time samples, interpolated as USD does (linearly, quaternions slerped), and retimed through layer offsets on sublayers, references and payloads and each layer's timeCodesPerSecond. Writing gives each animated node translate, orient and scale ops with time samples; USD's blending is glTF's linear, so linear keys stay as they are and steps and cubic splines get a sample every frame.
+- USD: every xform op's time samples, interpolated as USD does (linearly, quaternions slerped), and retimed through layer offsets on sublayers, references and payloads and each layer's timeCodesPerSecond. Writing gives each animated node translate, orient and scale ops with time samples; USD's blending is glTF's linear, so linear keys stay as they are and steps and cubic splines get a sample every frame. A mesh whose points have time samples plays them too, as a blend shape per sample (Pixar's library poses a test mesh as meshport does at every time code checked).
 - Alembic: an Xform's samples at their time sampling's times (uniform, cyclic or acyclic). Writing puts a transform sample every frame on one uniform time sampling.
 - 3DS (read): the keyframer's position, rotation and scale tracks, at 30 frames a second (3ds Max's default). Each rotation key turns on from the one before, and keys blend in a straight line: that's how 3ds Max's own poses, stored in files saved part way through an animation, come out (checked to float precision on two such files). The spline terms on keys are read past.
-- .blend (read): each object's action, the F-curves of Blender up to 4.3 and the layered actions of 4.4 on, at the scene's frame rate: Bezier keys (handles shortened as Blender shortens them), linear, constant and every easing mode, with constant or linear extrapolation (followed to the end of the scene's frame range), driving location, every rotation mode, scale and the delta transforms. Easing uses Robert Penner's published equations; Blender's exponential easing differs from them by up to 0.1% of the change, and its elastic easing scales the wobble by the key's amplitude. F-curve modifiers, drivers and the NLA are left out.
+- .blend (read): each object's action, the F-curves of Blender up to 4.3 and the layered actions of 4.4 on, at the scene's frame rate: Bezier keys (handles shortened as Blender shortens them), linear, constant and every easing mode, with constant or linear extrapolation (followed to the end of the scene's frame range), driving location, every rotation mode, scale and the delta transforms. Easing uses Robert Penner's published equations with Blender's own changes to exponential and elastic easing, so every mode lands where Blender puts it (within 4e-6 on the test file). F-curve modifiers apply too: Cycles (repeat, with offset or mirrored, for a number of cycles or for ever), Stepped, Limits and Generator, each with its frame range, blend in and out, and influence; nine test objects match Blender's poses within 7e-6. Noise and Envelope modifiers, drivers and the NLA are left out.
 
 **Skins and blend shapes** (glTF's skins and morph targets) are read from glTF, FBX, USD and .blend and written to glTF, FBX and USD, with blend shape weights animated like any other channel. A skinned vertex follows up to any number of joints by weight; the mesh's own node then plays no part, as in glTF.
 
@@ -179,7 +179,9 @@ What comes across in both directions:
 - Alembic: a mesh its skin or blend shapes bend over time gets its points every frame (a point cache), which Blender plays as meshport poses it; reading, a point cache (points changing, faces not) becomes a blend shape per stored sample, weighted so they play back as Alembic does. That takes the samples' offsets plus a row of weights per sample, up to 30 million values in all (`alembic.CACHE_BUDGET`); a bigger cache stands as its first sample.
 - Formats without skins (3DS, OBJ, and Alembic for what doesn't move) get each mesh bent where it stands, its shape keys at their weights.
 
-Not handled: cameras and lights. glTF files compressed with Draco or meshopt are refused with a clear error. meshport's GLBs pass Khronos' glTF Validator: a skinned mesh is written as a root without a transform (as glTF recommends), inverse bind matrices end in an exact (0, 0, 0, 1), and keys closer than 32-bit times can tell apart are one key.
+**Lights** (point, spot and sun) are read from .blend files and glTF (KHR_lights_punctual) and written to glTF, in glTF's units: Blender's watts become candela, and a sun's W/m² lux, at 683 lm/W, as Blender's own glTF export has it, so meshport's lights from a .blend file are Blender's exactly, and Blender reads them back as it wrote them. Area lights have no glTF kind and are left out (Blender's export leaves them out too), and so are lights in other formats.
+
+Not handled: cameras. glTF files compressed with Draco or meshopt are refused with a clear error. meshport's GLBs pass Khronos' glTF Validator: a skinned mesh is written as a root without a transform (as glTF recommends), inverse bind matrices end in an exact (0, 0, 0, 1), and keys closer than 32-bit times can tell apart are one key.
 
 3DS is an old format with hard limits, so a few things change on the way out:
 
@@ -188,13 +190,15 @@ Not handled: cameras and lights. glTF files compressed with Draco or meshopt are
 - There is no hierarchy: every mesh is written as its own object, in place.
 - Object names are cut to 10 characters and material names to 16, kept unique. Texture files get 8.3 names, which every 3DS reader accepts.
 
+OBJ has no hierarchy or units, so each object (`o`, or `g` in a file without objects) becomes a node of its own, in meters with Y up, as OBJ files are written. Reading takes polygons, normals, one UV set and vertex colors (sRGB in the file), negative indices, lines joined by `\`, and materials from every `.mtl` file named: base color, opacity (`d` or `Tr`), emissive, the PBR extension's `Pr` and `Pm`, and base color, emissive and normal textures (texture options such as `-s 2 2` are read past). Roughness and metallic without `Pr` and `Pm` are taken as Blender's importer takes them: roughness from `Ns` (0 to 1000), metallic from `Ka` where `illum` turns reflection on. Where a file gives no normals, its smoothing groups shade it as Blender does: faces in a group share normals across the edges between them, weighted by their angle at each vertex. Blender reads 12 objects written by its own exporter (with normals, and with smoothing groups instead) to the same points, normals, UVs, colors and materials as meshport, within 0.0002 (`tests/data/make_obj_fixture.py`). A 64 MB OBJ with a million triangles reads in 1.9 s, against 9.5 s for trimesh. Writing gives roughness both ways (`Ns` and `Pr`), so Blender and other readers get the same value back. Lines, points, curves and surfaces are skipped.
+
 When reading 3DS, the keyframer section supplies the hierarchy, pivots, dummy groups and instances. Animated files open at their first frame, as in Blender and Assimp, with the objects' animation as channels (above). Lights, cameras and cameras' animation are skipped; a camera that other objects hang from is kept as an empty group.
 
 Textures that glTF can't hold (TGA, PSD, TIFF, ...) are re-encoded to PNG when [Pillow](https://pypi.org/project/Pillow/) is installed (`pip install "meshport[images] @ git+https://github.com/puretechteam/meshport"`), and left out otherwise.
 
-Linked files are followed carefully, since a model from the internet can name any file. Texture paths (FBX, 3DS, USD, .blend), font paths (.blend) and USD sublayers, references and payloads are only read from the model's own folder and the folder above it, and below them: a relative path that stays in there is tried as written, and for textures and fonts the file name is looked for in those folders (for fonts also in the system's font folders, so a font from the machine the file was made on is still found). Absolute paths, network paths (`\\server\share\...`), URLs (`file:` included) and paths reaching further out are never opened, and a chain of USD references can't walk outward from one file to the next. Only files that really are images are taken as textures. glTF files may only point to paths relative to themselves, and their buffers must sit in the model's own folder.
+Linked files are followed carefully, since a model from the internet can name any file. Texture paths (FBX, 3DS, OBJ, USD, .blend), font paths (.blend), OBJ's `.mtl` files and USD sublayers, references and payloads are only read from the model's own folder and the folder above it, and below them: a relative path that stays in there is tried as written, and for textures and fonts the file name is looked for in those folders (for fonts also in the system's font folders, so a font from the machine the file was made on is still found). Absolute paths, network paths (`\\server\share\...`), URLs (`file:` included) and paths reaching further out are never opened, and a chain of USD references can't walk outward from one file to the next. Only files that really are images are taken as textures. glTF files may only point to paths relative to themselves, and their buffers must sit in the model's own folder.
 
-Hostile files can't stall meshport or fill the memory either: what one file can make it build is limited far above what real models need (a million nodes, `scene.MAX_NODES`, instances and glTF nodes listed under several parents included; 100,000 frames on an animation's frame grid, `scene.MAX_FRAMES`; and limits on decoding, decompressing and composing for each format). Reaching one raises `MeshportError` with a plain message. `tests/test_hostile.py` builds a file for every case, and `tests/test_fuzz.py` reads thousands of damaged and cut-short USD, Alembic and .blend files.
+Hostile files can't stall meshport or fill the memory either: what one file can make it build is limited far above what real models need (a million nodes, `scene.MAX_NODES`, instances and glTF nodes listed under several parents included; 100,000 frames on an animation's frame grid, `scene.MAX_FRAMES`; and limits on decoding, decompressing and composing for each format). Reaching one raises `MeshportError` with a plain message. `tests/test_hostile.py` builds a file for every case, and `tests/test_fuzz.py` reads thousands of damaged and cut-short USD, Alembic, OBJ and .blend files.
 
 ## The scene model
 
@@ -204,6 +208,7 @@ Every reader produces the same `Scene` and every writer takes one, so adding a f
 scene.roots                  # [Node]
 node.name, node.matrix       # local 4x4 transform, column vectors
 node.mesh, node.materials    # Mesh or None; material slots for the mesh's faces
+node.light                   # Light or None: kind, color, intensity, range, cone angles
 node.children
 mesh.positions               # (V, 3)
 mesh.face_sizes, mesh.corners  # polygons: corners per face, vertex index per corner
@@ -243,7 +248,7 @@ Conventions are glTF's: right-handed, +Y up, 1 unit = 1 meter. UVs have v = 0 at
 - **USD against Pixar's library.** `tests/test_usd_interop.py` (set `MESHPORT_PXR_PYTHON` to a Python with `usd-core`) has Pixar's library read meshport's files and run its validators, and builds the 17-file corpus above for meshport to read. With the copy of Pixar's library inside Blender, set `PXR_WORK_THREAD_LIMIT=1` too: its validators trip over their own threads otherwise. See [USD, Alembic and .blend](#usd-alembic-and-blend).
 - **USD, Alembic and .blend against Blender.** Run whenever Blender is installed: Blender reads meshport's USD and Alembic, meshport reads Blender's USD, Alembic and .blend, and both sides agree point for point. `tests/data/scene.blend` (rebuilt by `tests/data/make_blend_fixture.py`) covers every rotation mode, parenting with an inverse matrix, negative scale, a collection instance, a packed texture and two UV maps. `tests/data/modifiers.blend` (23 objects: every supported modifier and setting, a stack, a modifier that's off and one meshport skips) and `tests/data/curves.blend` (25 objects: every kind of curve, fill, text in a packed font and in Blender's own, and metaball families) are compared with Blender's GLB exports of them object by object. `tests/data/scene_283.blend` and `scene_35.blend` are the same scene saved by Blender 2.83 and 3.5, which store meshes the old way. `tests/test_blend_corpus.py` (with `MESHPORT_BLEND_CORPUS`) checks a folder of .blend files against Blender's exports of them, object by object; the three fixture scripts take `-- OUT_DIR NAME` to write their files with any Blender from 2.83 on.
 - **Real rigs.** `tests/test_real_rigs.py` (set `MESHPORT_REAL_RIGS` to a folder of Khronos' sample models: CesiumMan, BrainStem, Fox, RiggedFigure, RiggedSimple, SimpleSkin, AnimatedMorphCube, MorphStressTest, MorphPrimitivesTest) poses each as Blender's own import does, round-trips each through GLB, FBX, USDC and USDZ, has Blender pose meshport's FBX and USD of each, and, with `MESHPORT_PXR_PYTHON`, `MESHPORT_UNITY` and `MESHPORT_GLTF_VALIDATOR` (Khronos' gltf_validator) set, has Pixar's UsdSkel, Autodesk's FBX SDK and the validator check them too: every one agrees to 1e-4 of the model's size (most to 1e-6), and the validator finds no errors and no warnings the originals don't have.
-- **The test suite** (`pytest`) builds its own files. It checks round trips, hand-written ASCII 6 and 7 files, every transform feature, glTF corner cases (interleaved buffers, sparse accessors, strips, external buffers), animation in every format (sampling, every kind of FBX key, pivots under animation, USD layer offsets, Alembic time samplings, 3DS keyframer tracks, Blender's actions in both layouts, round trips, damaged channels, curves and samples; skins and blend shapes in glTF, FBX, USD and .blend, a skinned, shape-keyed tube from `tests/data/make_skin_fixture.py` posed as Blender poses it at every frame from Blender's glTF, FBX, USD and .blend (5.1 and 2.83) and Blender posing meshport's, Pixar's UsdSkel baking meshport's USD skins, damaged skins, clusters, bindings and targets; Blender in both directions for glTF, FBX, USD and Alembic, meshport posing Blender's exports as Blender does at every frame and Blender posing meshport's; and Pixar's own library, the copy inside Blender, posing meshport's USD and its layer offsets as meshport does, with its compliance checker finding nothing), 3DS smoothing groups and mesh splitting, damaged and hostile files in every format and, when Blender is installed, both directions of Blender interop.
+- **The test suite** (`pytest`) builds its own files. It checks round trips, hand-written ASCII 6 and 7 files, every transform feature, glTF corner cases (interleaved buffers, sparse accessors, strips, external buffers), animation in every format (sampling, every kind of FBX key, pivots under animation, USD layer offsets, Alembic time samplings, 3DS keyframer tracks, Blender's actions in both layouts, round trips, damaged channels, curves and samples; skins and blend shapes in glTF, FBX, USD and .blend, a skinned, shape-keyed tube from `tests/data/make_skin_fixture.py` posed as Blender poses it at every frame from Blender's glTF, FBX, USD and .blend (5.1 and 2.83) and Blender posing meshport's, Pixar's UsdSkel baking meshport's USD skins, damaged skins, clusters, bindings and targets; Blender in both directions for glTF, FBX, USD and Alembic, meshport posing Blender's exports as Blender does at every frame and Blender posing meshport's; and Pixar's own library, the copy inside Blender, posing meshport's USD and its layer offsets as meshport does, with its compliance checker finding nothing), 3DS smoothing groups and mesh splitting, damaged and hostile files in every format (each must give `MeshportError` and nothing else, not even a numpy warning: any warning fails the suite) and, when Blender is installed, both directions of Blender interop.
 
 ## Development
 
@@ -255,14 +260,14 @@ python -m venv .venv
 
 Code layout:
 
-- `src/meshport/fbxtree.py`: FBX as a raw record tree (binary and ASCII parsing, binary writing).
+- `src/meshport/fbxtree.py`: FBX as a raw record tree (binary and ASCII, parsing and writing).
 - `src/meshport/fbx.py`: the record tree ↔ `Scene`.
 - `src/meshport/fbxanim.py`: FBX animation curves.
 - `src/meshport/blendanim.py`: Blender actions and their F-curves.
 - `src/meshport/blendskin.py`: Blender armatures, vertex groups and shape keys.
 - `src/meshport/gltf.py`: glTF ↔ `Scene`.
 - `src/meshport/max3ds.py`: 3DS ↔ `Scene`.
-- `src/meshport/obj.py`: `Scene` → OBJ.
+- `src/meshport/obj.py`: OBJ ↔ `Scene`.
 - `src/meshport/usdlayer.py`: one USD layer in memory; `usda.py` and `usdcrate.py`: text and binary layers ↔ that; `usd.py`: composing layers into a `Scene`, a `Scene` into a layer, and `.usdz` packages.
 - `src/meshport/alembic.py`: Alembic ↔ `Scene`.
 - `src/meshport/blend.py`: `.blend` → `Scene`.

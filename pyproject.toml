@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "meshport"
 dynamic = ["version"]
-description = "Read and write FBX, glTF, 3DS, USD and Alembic, and read .blend files, in pure Python. No SDK, no 3D app."
+description = "Read and write FBX, glTF, 3DS, USD, Alembic and OBJ, and read .blend files, in pure Python. No SDK, no 3D app."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Pure Tech" }]
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
-keywords = ["fbx", "gltf", "glb", "3ds", "usd", "usdz", "alembic", "blend", "3d", "mesh", "converter"]
+keywords = ["fbx", "gltf", "glb", "3ds", "usd", "usdz", "alembic", "obj", "blend", "3d", "mesh", "converter"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Multimedia :: Graphics :: 3D Modeling",
@@ -22,7 +22,7 @@ classifiers = [
 images = ["Pillow>=10"]  # re-encode TGA/TIFF/PSD/... textures to PNG for glTF and USDZ
 blend = ["backports.zstd>=1.0; python_version < '3.14'", "fonttools>=4.40"]  # compressed .blend files (Python 3.14 has zstd) and text objects
 dev = ["pytest>=8", "Pillow>=10", "trimesh>=4", "scipy>=1.10", "backports.zstd>=1.0; python_version < '3.14'",
-       "fonttools>=4.40", "ruff>=0.16,<0.17"]
+       "fonttools>=4.40", "lz4>=4", "ruff>=0.16,<0.17"]
 
 [project.scripts]
 meshport = "meshport.__main__:main"
@@ -38,3 +38,5 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# A warning is a bug (a damaged file must give MeshportError, not a numpy warning): fail on any.
+filterwarnings = ["error"]

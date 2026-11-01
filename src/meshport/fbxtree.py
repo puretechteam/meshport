@@ -323,10 +323,14 @@ def _numbers(chunk: str) -> np.ndarray:
         raise MeshportError(f"This FBX file is damaged ({e})") from None
 
 
+ASCII_ROW = 64  # array values on one line of an ASCII file, as Autodesk's own writer wraps them
+
+
 def write_ascii(records: list[Record], version: int = 7400) -> str:
-    """Readable dump, mainly for debugging and tests."""
+    """The records as an ASCII FBX file: names and values as text, arrays as *N { a: ... }
+    blocks, embedded files as base64 text."""
     major, minor = divmod(version, 1000)
-    lines = [f"; FBX {major}.{minor // 100}.0 project file", ""]
+    lines = [f"; FBX {major}.{minor // 100}.0 project file", "; " + "-" * 52, ""]
 
     def fmt(p):
         if isinstance(p, (bool, np.bool_)):
@@ -347,9 +351,12 @@ def write_ascii(records: list[Record], version: int = 7400) -> str:
         arrays = [p for p in rec.props if isinstance(p, np.ndarray)]
         if arrays:
             arr = arrays[0]
-            vals = ",".join(fmt(v) for v in (arr.tolist()))
+            if arr.dtype == np.bool_:
+                arr = arr.astype(np.int32)  # an ASCII array of booleans is 0s and 1s
+            values = [fmt(v) for v in arr.tolist()]
+            rows = [",".join(values[i:i + ASCII_ROW]) for i in range(0, len(values), ASCII_ROW)] or [""]
             lines.append(f"{pad}{rec.name}: *{len(arr)} {{")
-            lines.append(f"{pad}\ta: {vals}")
+            lines.append(f"{pad}\ta: " + f",\n{pad}\t".join(rows))
             lines.append(f"{pad}}}")
             return
         head = f"{pad}{rec.name}: " + ", ".join(fmt(p) for p in rec.props)

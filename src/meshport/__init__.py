@@ -12,12 +12,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from .scene import (
     Animation,
     Channel,
     Image,
+    Light,
     Material,
     Mesh,
     MeshportError,
@@ -29,10 +30,10 @@ from .scene import (
 
 FORMATS = {"fbx": "FBX", "glb": "glTF binary", "gltf": "glTF", "3ds": "Autodesk 3DS",
            "usd": "USD", "usda": "USD text", "usdc": "USD binary", "usdz": "USD package", "abc": "Alembic",
-           "blend": "Blender (read only)", "obj": "Wavefront OBJ (write only)"}
+           "blend": "Blender (read only)", "obj": "Wavefront OBJ"}
 _USD = ("usd", "usda", "usdc", "usdz")
 
-__all__ = ["FORMATS", "Animation", "Channel", "Image", "Material", "Mesh", "MeshportError", "Morph", "Node", "Scene",
+__all__ = ["FORMATS", "Animation", "Channel", "Image", "Light", "Material", "Mesh", "MeshportError", "Morph", "Node", "Scene",
            "Skin", "__version__", "load", "read", "save", "write"]
 
 
@@ -56,6 +57,9 @@ def _module(fmt: str):
     if fmt == "blend":
         from . import blend
         return blend
+    if fmt == "obj":
+        from . import obj
+        return obj
     raise MeshportError(f"meshport doesn't handle .{fmt} files (it handles {', '.join(FORMATS)})")
 
 
@@ -87,6 +91,9 @@ def _sniff(data: bytes) -> str | None:
         return "fbx"
     if head.startswith(b"{") and b'"asset"' in data[:1 << 16]:
         return "gltf"
+    from .obj import detect as obj
+    if obj(data):
+        return "obj"
     return None
 
 
@@ -98,10 +105,12 @@ def read(data: bytes, fmt: str | None = None, base_dir: str | os.PathLike | None
     return _module(fmt).read(data, base_dir)
 
 
-def write(scene: Scene, fmt: str) -> bytes:
+def write(scene: Scene, fmt: str, ascii: bool = False) -> bytes:
     """File bytes. 3DS and USD layers (other than .usdz) only name their textures: save()
-    writes them next to the file."""
+    writes them next to the file. ascii=True writes FBX as text instead of binary."""
     fmt = fmt.lower().lstrip(".")
+    if ascii and fmt != "fbx":
+        raise MeshportError("Only FBX can be written as ASCII")
     if fmt == "obj":
         raise MeshportError("OBJ is a set of files (.obj, .mtl, textures): write it with save()")
     if fmt == "blend":
@@ -111,6 +120,8 @@ def write(scene: Scene, fmt: str) -> bytes:
         return mod.write(scene, binary=fmt == "glb")
     if fmt in _USD:
         return mod.write(scene, "usdc" if fmt == "usd" else fmt)
+    if fmt == "fbx":
+        return mod.write(scene, ascii)
     return mod.write(scene)
 
 
@@ -121,12 +132,14 @@ def load(path: str | os.PathLike, fmt: str | None = None) -> Scene:
     return read(data, fmt or _sniff(data) or path.suffix, path.parent)
 
 
-def save(scene: Scene, path: str | os.PathLike, fmt: str | None = None) -> list[Path]:
+def save(scene: Scene, path: str | os.PathLike, fmt: str | None = None, ascii: bool = False) -> list[Path]:
     """Write a file; the format comes from the extension unless given. Returns every file
     written (OBJ also writes a .mtl and textures next to it, 3DS its textures, and USD other
-    than .usdz its textures in a textures folder)."""
+    than .usdz its textures in a textures folder). ascii=True writes FBX as text."""
     path = Path(path)
     fmt = (fmt or path.suffix).lower().lstrip(".")
+    if ascii and fmt != "fbx":
+        raise MeshportError("Only FBX can be written as ASCII")
     if fmt == "obj":
         from . import obj
         return obj.write_file(scene, path)
@@ -136,5 +149,5 @@ def save(scene: Scene, path: str | os.PathLike, fmt: str | None = None) -> list[
     if fmt in _USD:
         from . import usd
         return usd.write_file(scene, path, "usdc" if fmt == "usd" else fmt)
-    path.write_bytes(write(scene, fmt))
+    path.write_bytes(write(scene, fmt, ascii))
     return [path]

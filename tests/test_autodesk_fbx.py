@@ -243,7 +243,9 @@ def autodesk(tmp_path_factory):
     for name, props in PROBES.items():
         (work / f"{name}.fbx").write_bytes(_transform_probe(props, active=name != "inactive"))
     meshport.save(animated(), work / "ours.fbx")
+    meshport.save(animated(), work / "ours_ascii.fbx", ascii=True)
     meshport.save(rigged(), work / "rigged.fbx")
+    meshport.save(rigged(), work / "rigged_ascii.fbx", ascii=True)
     meshport.save(meshport.load(DATA / "skin.blend"), work / "blender_skin.fbx")
     (work / "total1.fbx").write_bytes(_total_one_probe())
     (work / "inbetween.fbx").write_bytes(inbetween_fbx())
@@ -274,6 +276,14 @@ def test_autodesk_reads_our_animation(autodesk):
     frames = poses["ours.fbx"]
     assert len(frames) == 49  # 2 seconds at 24 frames per second
     assert _compare(animated(), frames, "ours") < 1e-4
+
+
+def test_autodesk_reads_our_ascii_fbx(autodesk):
+    """The same animation and rig written as ASCII: Autodesk's SDK poses and bends them as the binary files."""
+    _, poses = autodesk
+    assert len(poses["ours_ascii.fbx"]) == 49
+    assert _compare(animated(), poses["ours_ascii.fbx"], "ours") < 1e-4
+    assert _compare_bent(rigged(), poses["rigged_ascii.fbx"], "Body") < 1e-4
 
 
 def _compare_bent(scene: Scene, frames: dict, name: str) -> float:

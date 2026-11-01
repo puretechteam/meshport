@@ -107,6 +107,17 @@ step.parent = obj
 step.location = (1.5, 0, 0.3)
 step.rotation_euler = (0, 0, math.radians(40))
 modifier(obj, "ARRAY", count=5, use_relative_offset=False, use_object_offset=True, offset_object=step)
+start_cap = add("cone", "CapCone", vertices=6, depth=0.6, radius1=0.3)  # its own place doesn't count, only its shape
+start_cap.rotation_euler = (0.4, 0, 0.7)
+end_cap = add("uv_sphere", "CapSphere", segments=8, ring_count=5, radius=0.35)
+end_cap.data.materials.append(mat_b)
+obj = add("cube", "ArrayCaps", scale=(0.3, 0.3, 0.3))
+obj.data.materials.append(mat_a)
+modifier(obj, "ARRAY", count=3, relative_offset_displace=(1.2, 0, 0.2), start_cap=start_cap, end_cap=end_cap)
+plug = add("cylinder", "CapPlug", vertices=8, depth=0.5)  # meets the array's ends, so it merges with them
+obj = add("cylinder", "ArrayCapsMerge", vertices=8, depth=1)
+modifier(obj, "ARRAY", count=2, use_relative_offset=False, use_constant_offset=True,
+         constant_offset_displace=(0, 0, 1.0), use_merge_vertices=True, start_cap=plug, end_cap=plug)
 
 # Solidify
 obj = add("grid", "SolidifyPlane", x_subdivisions=4, y_subdivisions=3, size=3)
@@ -126,6 +137,34 @@ modifier(add("cylinder", "SubsurfNgon", vertices=7), "SUBSURF", levels=2)
 modifier(add("monkey", "SubsurfMonkey"), "SUBSURF", levels=1)
 modifier(add("cube", "SubsurfNoLimit"), "SUBSURF", levels=2, use_limit_surface=False)
 modifier(add("cube", "SubsurfSimple"), "SUBSURF", levels=2, subdivision_type="SIMPLE")
+for uv_smooth in ("NONE", "SMOOTH_ALL", "PRESERVE_CORNERS"):  # UVs (the default keeps boundaries)
+    modifier(add("cylinder", f"SubsurfUV_{uv_smooth}", vertices=7), "SUBSURF", levels=2, uv_smooth=uv_smooth)
+
+
+def crease(obj, value, vertex=None):
+    """Crease the cube's top edges (and one vertex) by value."""
+    me = obj.data
+    top = [e.index for e in me.edges if all(me.vertices[v].co.z > 0 for v in e.vertices)]
+    if hasattr(me.edges[0], "crease"):  # before Blender 4.0
+        for i in top:
+            me.edges[i].crease = value
+        if vertex is not None and hasattr(me.vertices[0], "crease"):
+            me.vertices[vertex].crease = 1.0
+        return
+    layer = me.attributes.new("crease_edge", "FLOAT", "EDGE")
+    for i in top:
+        layer.data[i].value = value
+    if vertex is not None:
+        me.attributes.new("crease_vert", "FLOAT", "POINT").data[vertex].value = 1.0
+
+
+for value in (1.0, 0.5, 0.3):  # sharpness 10, 2.5 and 0.9: sharp, then fading over the levels
+    obj = add("cube", f"SubsurfCrease{int(value * 10)}")
+    crease(obj, value)
+    modifier(obj, "SUBSURF", levels=2)
+obj = add("cube", "SubsurfCreaseVertex")
+crease(obj, 0.7, vertex=0)
+modifier(obj, "SUBSURF", levels=3)
 
 # a stack, one modifier off in the viewport, and one meshport doesn't know (skipped)
 obj = add("cube", "Stack", location=(0.8, 0, 0))

@@ -10,6 +10,7 @@ corners. UV coordinates use the FBX/OpenGL convention: v = 0 at the bottom of th
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -227,6 +228,21 @@ def pack_influences(rows: np.ndarray, joints: np.ndarray, weights: np.ndarray, c
 
 
 @dataclass(eq=False)
+class Light:
+    """A light as glTF's KHR_lights_punctual has it, shining down its node's -Z axis: a point,
+    a spot or the sun ("directional"). Linear RGB color; intensity in candela (point and spot)
+    or lux (directional); range in meters (None: no limit); a spot's cone angles in radians
+    from its axis, full brightness inside the inner one."""
+    name: str
+    kind: str = "point"
+    color: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    intensity: float = 1.0
+    range: float | None = None
+    inner_cone: float = 0.0
+    outer_cone: float = math.pi / 4
+
+
+@dataclass(eq=False)
 class Node:
     name: str
     matrix: np.ndarray = field(default_factory=lambda: np.eye(4))  # local, column vectors
@@ -234,6 +250,7 @@ class Node:
     materials: list[Material] = field(default_factory=list)  # slots for mesh.face_materials
     children: list[Node] = field(default_factory=list)
     skin: Skin | None = None    # bends mesh with a skeleton
+    light: Light | None = None
 
     def walk(self, parent: np.ndarray | None = None):
         """Yield (node, world_matrix) for this node and everything under it, parents first. A loop

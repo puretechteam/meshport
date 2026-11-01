@@ -14,6 +14,7 @@ def main(argv: list[str] | None = None) -> int:
                                  f"Formats: {', '.join(FORMATS)}.")
     ap.add_argument("src", help="file to read")
     ap.add_argument("dst", nargs="?", help="file to write (omit to print what's inside)")
+    ap.add_argument("--ascii", action="store_true", help="write FBX as text (ASCII) instead of binary")
     ap.add_argument("--version", action="version", version=f"meshport {__version__}")
     args = ap.parse_args(argv)
     try:
@@ -29,7 +30,7 @@ def main(argv: list[str] | None = None) -> int:
             if b is not None:
                 print("size (m):", " x ".join(f"{v:.3g}" for v in b[1] - b[0]))
             return 0
-        save(scene, args.dst)
+        save(scene, args.dst, ascii=args.ascii)
         print(f"{args.src} -> {args.dst} in {time.perf_counter() - start:.2f}s")
         return 0
     except (MeshportError, OSError) as e:

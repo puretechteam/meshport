@@ -10,11 +10,17 @@ Between two keys the first key's interpolation applies: constant, linear, Bezier
 shortened when they reach past each other's key, as Blender does, with the curve solved for the
 frame), or one of the easing modes (back, bounce, circular, cubic, elastic, exponential,
 quadratic, quartic, quintic, sine), each easing in, out or both, by Robert Penner's published
-equations. Blender gives the same for all but two: it changes exponential easing a little (by up
-to 0.1% of the change) and scales elastic easing's wobble by the key's amplitude, which these
-equations don't. Before the first key and after the last, the curve holds (constant
-extrapolation) or carries on in a line (linear). F-curve modifiers, drivers and the NLA are left
-out.
+equations with Blender's two changes: exponential easing is shifted and stretched by 2^-10 so it
+starts and ends on its keys, and elastic easing's wobble is scaled by the key's amplitude (and
+faded in where the amplitude is under the change). Before the first key and after the last, the
+curve holds (constant extrapolation) or carries on in a line (linear).
+
+F-curve modifiers apply as in Blender: Cycles (repeat, repeat with offset, mirrored; a number of
+cycles or for ever, on either side), Stepped, Limits and Generator (expanded or factorised
+polynomials, replacing the curve or added to it), each with its frame range, blend in and out,
+and influence. Time modifiers go from the last to the first, value modifiers from the first to
+the last, and Cycles only as the first. Noise, Envelope and Python modifiers, drivers and the
+NLA are left out.
 """
 
 from __future__ import annotations
@@ -26,18 +32,112 @@ import numpy as np
 CONSTANT, LINEAR, BEZIER = 0, 1, 2
 BACK, BOUNCE, CIRC, CUBIC, ELASTIC, EXPO, QUAD, QUART, QUINT, SINE = range(3, 13)
 EASE_AUTO, EASE_IN, EASE_OUT, EASE_IN_OUT = 0, 1, 2, 3
+# FModifier types and flags
+GENERATOR, CYCLES, LIMITS, STEPPED = 1, 4, 8, 9
+_DISABLED, _MUTED, _RANGE, _INFLUENCE = 1, 8, 16, 32
+_CYCLE_REPEAT, _CYCLE_OFFSET, _CYCLE_MIRROR = 1, 2, 3
+_LIMIT_XMIN, _LIMIT_XMAX, _LIMIT_YMIN, _LIMIT_YMAX = 1, 2, 4, 8
+_STEPPED_NO_BEFORE, _STEPPED_NO_AFTER = 1, 2
+
+
+class Modifier:
+    """One F-curve modifier: its type, flags, influence, frame range with blend in and out, and
+    its own settings (a dict)."""
+
+    def __init__(self, kind: int, flag: int, influence: float, start: float, end: float, blend_in: float,
+                 blend_out: float, settings: dict):
+        self.kind, self.flag, self.influence = kind, flag, influence
+        self.start, self.end, self.blend_in, self.blend_out, self.settings = start, end, blend_in, blend_out, settings
+
+    def weight(self, t: np.ndarray) -> np.ndarray:
+        """How much the modifier counts at each frame (Blender's eval_fmodifier_influence)."""
+        w = np.full(t.shape, self.influence if self.flag & _INFLUENCE else 1.0)
+        if self.flag & _RANGE:
+            a, b = self.start, self.end
+            out = (t <= a) | (t >= b)
+            if self.blend_in:
+                ramp = (t >= a) & (t <= a + self.blend_in)
+                w = np.where(ramp, w * (t - a) / self.blend_in, w)
+            if self.blend_out:
+                ramp = (t <= b) & (t >= b - self.blend_out) & ~((t >= a) & (t <= a + self.blend_in) & (self.blend_in != 0))
+                w = np.where(ramp, w * (t - b) / -self.blend_out, w)
+            w = np.where(out, 0.0, w)
+        return w
+
+    def active(self, t: np.ndarray) -> np.ndarray:
+        if self.flag & _RANGE:
+            return (t >= self.start) & (t <= self.end)
+        return np.ones(t.shape, bool)
 
 
 class FCurve:
     def __init__(self, path: str, index: int, keys: np.ndarray, ipo: np.ndarray, easing: np.ndarray,
-                 params: np.ndarray, extend: int):
+                 params: np.ndarray, extend: int, modifiers: list[Modifier] | None = None):
         # keys: (N, 3, 2), each key's left handle, key and right handle as (frame, value);
         # params: (N, 3), each key's back, amplitude and period
         self.path, self.index, self.keys, self.ipo, self.easing, self.params, self.extend = \
             path, index, keys, ipo, easing, params, extend
+        self.modifiers = [m for m in modifiers or [] if not m.flag & (_DISABLED | _MUTED)]
+        if any(m.kind == CYCLES for m in self.modifiers[1:]):  # Blender runs Cycles only first in the stack
+            self.modifiers = self.modifiers[:1] + [m for m in self.modifiers[1:] if m.kind != CYCLES]
+
+    @property
+    def carries_on(self) -> bool:
+        """Whether the curve keeps changing past its keys (linear extrapolation, or modifiers)."""
+        return bool(self.extend or self.modifiers)
 
     def evaluate(self, frames: np.ndarray) -> np.ndarray:
         frames = np.asarray(frames, np.float64)
+        if not self.modifiers:
+            return self._keyed(frames)
+        t, offset = frames, np.zeros(frames.shape)
+        for m in reversed(self.modifiers):  # time first, last modifier to first
+            if m.kind in (CYCLES, STEPPED, LIMITS):
+                new, shift = self._time(m, t)
+                w, on = m.weight(t), m.active(t)
+                if m.kind == CYCLES:
+                    offset = np.where(on, shift, offset)
+                t = np.where(on, w * new + (1 - w) * t, t)
+        value = self._keyed(t)
+        for m in self.modifiers:  # then values, first to last
+            w, on = m.weight(t), m.active(t)
+            if m.kind == CYCLES:
+                new = value + offset
+            elif m.kind == LIMITS:
+                new = value
+                if m.settings["flag"] & _LIMIT_YMIN:
+                    new = np.maximum(new, m.settings["ymin"])
+                if m.settings["flag"] & _LIMIT_YMAX:
+                    new = np.minimum(new, m.settings["ymax"])
+            elif m.kind == GENERATOR:
+                new = _generate(m.settings, t, value)
+            else:
+                continue
+            value = np.where(on, w * new + (1 - w) * value, value)
+        return value
+
+    def _time(self, m: Modifier, t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The frame a time modifier evaluates the keys at, and (for Cycles) the value offset."""
+        st = m.settings
+        if m.kind == STEPPED:
+            step = st["step"] or 1.0
+            snapped = np.trunc((t - st["offset"]) / step) * step + st["offset"]  # C's int(): towards zero
+            keep = np.zeros(t.shape, bool)
+            if st["flag"] & _STEPPED_NO_BEFORE:
+                keep |= t < st["start"]
+            if st["flag"] & _STEPPED_NO_AFTER:
+                keep |= t > st["end"]
+            return np.where(keep, t, snapped), np.zeros(t.shape)
+        if m.kind == LIMITS:
+            out = t
+            if st["flag"] & _LIMIT_XMIN:
+                out = np.where(out < st["xmin"], st["xmin"], out)
+            if st["flag"] & _LIMIT_XMAX:
+                out = np.where(out > st["xmax"], st["xmax"], out)
+            return out, np.zeros(t.shape)
+        return _cycle(self.keys[0, 1], self.keys[-1, 1], st, t)
+
+    def _keyed(self, frames: np.ndarray) -> np.ndarray:
         keys = self.keys
         x, y = keys[:, 1, 0], keys[:, 1, 1]
         if len(keys) == 1:
@@ -80,6 +180,61 @@ class FCurve:
             return _bezier(a[1], a[2], b[0], b[1], np.clip(f, x0, x1))
         back, amplitude, period = self.params[i]
         return _ease(ipo, int(self.easing[i]), t, y0, y1 - y0, d, back, amplitude, period)
+
+
+def _cycle(first, last, st: dict, t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Blender's Cycles modifier (fcm_cycles_time): the frame within the keyed range, and the
+    value offset of repeating with offset."""
+    t = np.asarray(t, np.float64)
+    out, offset = t.copy(), np.zeros(t.shape)
+    dx, dy = last[0] - first[0], last[1] - first[1]
+    if dx == 0:
+        return out, offset
+    for side, mode, count, at in ((-1, st["before_mode"], st["before_cycles"], first[0]),
+                                  (1, st["after_mode"], st["after_cycles"], last[0])):
+        sel = (t < first[0]) if side < 0 else (t > last[0])
+        if not mode or not sel.any():
+            continue
+        e = t[sel]
+        cycle = side * (e - at) / dx
+        within = np.fmod(e - at, dx)
+        go = np.ones(e.shape, bool) if count == 0 else cycle <= count
+        new = first[0] + within
+        mirror = mode == _CYCLE_MIRROR
+        if mirror:
+            odd = (np.trunc(cycle + 1).astype(np.int64) % 2) != 0
+            new = np.where(odd, (first[0] if side < 0 else last[0]) - within, new)
+        edge = within == 0
+        edge_t = np.full(e.shape, last[0] if side == 1 else first[0])
+        if mirror:
+            edge_t = np.where(np.trunc(cycle).astype(np.int64) % 2 != 0, first[0] if side == 1 else last[0], edge_t)
+        new = np.where(edge, edge_t, new)
+        new = np.where(new < first[0], new + dx, new)
+        shift = np.zeros(e.shape)
+        if mode == _CYCLE_OFFSET:
+            shift = (np.floor((e - at) / dx) if side < 0 else np.ceil((e - at) / dx)) * dy
+        out[sel] = np.where(go, new, e)
+        offset[sel] = np.where(go, shift, 0.0)
+    return out, offset
+
+
+def _generate(st: dict, t: np.ndarray, value: np.ndarray) -> np.ndarray:
+    """Blender's Generator modifier: an expanded polynomial (c0 + c1 t + c2 t^2 ...) or a
+    factorised one ((a1 t + b1)(a2 t + b2)...), in place of the curve or added to it."""
+    c, order = st["coefficients"], st["order"]
+    if not order or not len(c):
+        return value
+    if st["mode"] == 1:
+        made = np.ones(t.shape)
+        for i in range(min(order, len(c) // 2)):
+            made = made * (c[2 * i] * t + c[2 * i + 1])
+    else:
+        made = np.zeros(t.shape)
+        power = np.ones(t.shape)
+        for k in c:
+            made = made + k * power
+            power = power * t
+    return value + made if st["flag"] & 1 else made
 
 
 def _bezier(p0, p1, p2, p3, f: np.ndarray) -> np.ndarray:
@@ -135,36 +290,62 @@ def _bounce_in(t, b, c, d, *_):
     return c - _bounce_out(d - t, 0, c, d) + b
 
 
-def _elastic_parts(c, d, amplitude, period):
-    period = period if period else d * 0.3
+def _elastic(t, b, c, d, amplitude, period, side):
+    """Blender's elastic easing (BLI_easing): Penner's, with the wobble scaled by amplitude / |c|
+    when the amplitude is under the change (and faded in over the first quarter period).
+    side: -1 in, 1 out, 0 in and out."""
+    t = np.asarray(t, np.float64)
+    if side == 0:
+        u = t / (d / 2) - 1
+        period = period if period else d * (0.3 * 1.5)
+    else:
+        u = t / d - 1 if side < 0 else -(t / d)
+        period = period if period else d * 0.3
+    f = np.ones_like(u)
     if not amplitude or amplitude < abs(c):
-        return c, period, period / 4
-    return amplitude, period, period / (2 * math.pi) * math.asin(c / amplitude)
+        s = period / 4
+        if c:
+            scale = amplitude / abs(c) if amplitude else 0.0
+            near = np.abs(u * d) < abs(s)
+            fade = np.abs(u * d) / abs(s) if s else np.zeros_like(u)
+            f = np.where(near, scale * fade + (1 - fade), scale)
+        amplitude = c
+    else:
+        s = period / (2 * math.pi) * math.asin(c / amplitude)
+    with np.errstate(over="ignore", invalid="ignore"):
+        if side == 0:  # the first half eases in, the second (time turned round) out
+            in_half = u < 0
+            w = np.where(in_half, u, -u)
+            wave = amplitude * 2.0 ** (10 * w) * np.sin((w * d - s) * (2 * math.pi) / period)
+            v = np.where(in_half, -0.5 * f * wave + b, 0.5 * f * wave + c + b)
+        else:
+            wave = amplitude * 2.0 ** (10 * u) * np.sin((u * d - s) * (2 * math.pi) / period)
+            v = -f * wave + b if side < 0 else f * wave + c + b
+    return np.where(t <= 0, b, np.where(t >= d, b + c, v))
 
 
 def _elastic_in(t, b, c, d, _back, amplitude, period):
-    a, p, s = _elastic_parts(c, d, amplitude, period)
-    u = t / d - 1
-    with np.errstate(over="ignore"):
-        v = -(a * 2.0 ** (10 * u) * np.sin((u * d - s) * (2 * math.pi) / p)) + b
-    return np.where(t <= 0, b, np.where(t >= d, b + c, v))
+    return _elastic(t, b, c, d, amplitude, period, -1)
 
 
 def _elastic_out(t, b, c, d, _back, amplitude, period):
-    a, p, s = _elastic_parts(c, d, amplitude, period)
-    u = t / d
-    v = a * 2.0 ** (-10 * u) * np.sin((u * d - s) * (2 * math.pi) / p) + c + b
-    return np.where(t <= 0, b, np.where(t >= d, b + c, v))
+    return _elastic(t, b, c, d, amplitude, period, 1)
 
 
 def _elastic_in_out(t, b, c, d, _back, amplitude, period):
-    period = period if period else d * (0.3 * 1.5)
-    a, p, s = _elastic_parts(c, d, amplitude, period)
-    u = t / (d / 2) - 1
-    with np.errstate(over="ignore"):
-        first = -0.5 * (a * 2.0 ** (10 * u) * np.sin((u * d - s) * (2 * math.pi) / p)) + b
-        second = a * 2.0 ** (-10 * u) * np.sin((u * d - s) * (2 * math.pi) / p) * 0.5 + c + b
-    return np.where(t <= 0, b, np.where(t >= d, b + c, np.where(u < 0, first, second)))
+    return _elastic(t, b, c, d, amplitude, period, 0)
+
+
+# Blender's exponential easing: 2^(10(x - 1)) shifted down by 2^-10 and stretched back to 0..1
+_POW_MIN, _POW_SCALE = 2.0 ** -10, 1 / (1 - 2.0 ** -10)
+
+
+def _expo_in(t, b, c, d, *_):
+    return np.where(t <= 0, b, c * (2.0 ** (10 * (t / d - 1)) - _POW_MIN) * _POW_SCALE + b)
+
+
+def _expo_out(t, b, c, d, *_):
+    return np.where(t <= 0, b, c * (1 - (2.0 ** (-10 * t / d) - _POW_MIN) * _POW_SCALE) + b)
 
 
 def _poly(n):
@@ -187,7 +368,7 @@ _IN = {
     CIRC: lambda t, b, c, d, *_: -c * (np.sqrt(np.maximum(1 - (t / d) ** 2, 0)) - 1) + b,
     CUBIC: _CUBIC[0],
     ELASTIC: _elastic_in,
-    EXPO: lambda t, b, c, d, *_: np.where(t <= 0, b, c * 2.0 ** (10 * (t / d - 1)) + b),
+    EXPO: _expo_in,
     QUAD: _QUAD[0], QUART: _QUART[0], QUINT: _QUINT[0],
     SINE: lambda t, b, c, d, *_: -c * np.cos(t / d * (math.pi / 2)) + c + b,
 }
@@ -197,7 +378,7 @@ _OUT = {
     CIRC: lambda t, b, c, d, *_: c * np.sqrt(np.maximum(1 - (t / d - 1) ** 2, 0)) + b,
     CUBIC: _CUBIC[1],
     ELASTIC: _elastic_out,
-    EXPO: lambda t, b, c, d, *_: np.where(t >= d, b + c, c * (1 - 2.0 ** (-10 * t / d)) + b),
+    EXPO: _expo_out,
     QUAD: _QUAD[1], QUART: _QUART[1], QUINT: _QUINT[1],
     SINE: lambda t, b, c, d, *_: c * np.sin(t / d * (math.pi / 2)) + b,
 }
@@ -223,8 +404,9 @@ def _circ_in_out(t, b, c, d, *_):
 def _expo_in_out(t, b, c, d, *_):
     u = t / (d / 2)
     with np.errstate(over="ignore"):
-        v = np.where(u < 1, c / 2 * 2.0 ** (10 * (u - 1)) + b, c / 2 * (-(2.0 ** (-10 * (u - 1))) + 2) + b)
-    return np.where(t <= 0, b, np.where(t >= d, b + c, v))
+        v = np.where(u < 1, c / 2 * (2.0 ** (10 * (u - 1)) - _POW_MIN) * _POW_SCALE + b,
+                     c / 2 * (2 - (2.0 ** (-10 * (u - 1)) - _POW_MIN) * _POW_SCALE) + b)
+    return np.where(t <= 0, b, v)
 
 
 _IN_OUT = {
@@ -316,7 +498,44 @@ def _fcurve(f, fc) -> FCurve | None:
         return None
     order = np.argsort(keys[:, 1, 0], kind="stable")
     return FCurve(path, int(fc.get("array_index", 0) or 0), keys[order], np.array(ipo)[order], np.array(easing)[order],
-                  np.array(params, np.float64)[order], int(fc.get("extend", 0) or 0))
+                  np.array(params, np.float64)[order], int(fc.get("extend", 0) or 0), _modifiers(f, fc))
+
+
+_MODIFIER_DATA = {GENERATOR: "FMod_Generator", CYCLES: "FMod_Cycles", LIMITS: "FMod_Limits", STEPPED: "FMod_Stepped"}
+
+
+def _modifiers(f, fc) -> list[Modifier]:
+    """The F-curve's modifiers meshport applies, in stack order (others are left out)."""
+    out = []
+    for fm in fc.listbase("modifiers", "FModifier"):
+        kind = int(fm.get("type", 0) or 0)
+        name = _MODIFIER_DATA.get(kind)
+        if name is None or name not in f.struct_index:
+            continue
+        data = fm.follow("data", name)
+        if data is None:
+            continue
+        if kind == CYCLES:
+            settings = {k: int(data.get(k, 0) or 0) for k in ("before_mode", "after_mode", "before_cycles",
+                                                               "after_cycles")}
+        elif kind == STEPPED:
+            settings = {"step": float(data.get("step_size", 2.0) or 0.0), "offset": float(data.get("offset", 0.0)),
+                        "start": float(data.get("start_frame", 0.0)), "end": float(data.get("end_frame", 0.0)),
+                        "flag": int(data.get("flag", 0) or 0)}
+        elif kind == LIMITS:
+            rect = data.get("rect")
+            values = [float(rect.get(k, 0.0)) for k in ("xmin", "xmax", "ymin", "ymax")] if rect is not None else [0] * 4
+            settings = dict(zip(("xmin", "xmax", "ymin", "ymax"), values), flag=int(data.get("flag", 0) or 0))
+        else:
+            size = int(data.get("arraysize", 0) or 0)
+            coefficients = data.raw("coefficients", "<f4", size) if 0 < size <= 1024 else None
+            settings = {"coefficients": [] if coefficients is None else [float(x) for x in coefficients],
+                        "order": int(data.get("poly_order", 0) or 0), "mode": int(data.get("mode", 0) or 0),
+                        "flag": int(data.get("flag", 0) or 0)}
+        out.append(Modifier(kind, int(fm.get("flag", 0) or 0), float(fm.get("influence", 1.0)),
+                            float(fm.get("sfra", 0.0)), float(fm.get("efra", 0.0)), float(fm.get("blendin", 0.0)),
+                            float(fm.get("blendout", 0.0)), settings))
+    return out
 
 
 # the object fields each data path animates: (field, first component) per array index

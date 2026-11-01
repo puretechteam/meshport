@@ -159,11 +159,14 @@ def modified():
 
 # Blender places smoothed boundary corners on an approximation of the limit surface, and Solidify's even
 # thickness divides by a cosine near zero at one of the monkey's vertices (6 m out), where float precision tells
-TOLERANCE = {"SubsurfGridAll": 5e-3, "SolidifyEven": 0.05}
+# A 0.7 crease (sharpness 4.9) next to a creased corner, three levels down, comes out 6% sharper than Blender's
+TOLERANCE = {"SubsurfGridAll": 5e-3, "SolidifyEven": 0.05, "SubsurfCreaseVertex": 0.07}
 MODIFIED = ["TriShortest", "TriBeauty", "WeldAll", "WeldConnected", "MirrorX", "MirrorBisect", "MirrorObject",
-            "ArrayRelative", "ArrayMerge", "ArrayFit", "ArrayObject", "SolidifyPlane", "SolidifyEven", "SolidifyRimOnly",
-            "SubsurfCube", "SubsurfGridCorners", "SubsurfGridAll", "SubsurfNgon", "SubsurfMonkey", "SubsurfNoLimit",
-            "SubsurfSimple", "Stack"]
+            "ArrayRelative", "ArrayMerge", "ArrayFit", "ArrayObject", "ArrayCaps", "ArrayCapsMerge", "SolidifyPlane",
+            "SolidifyEven", "SolidifyRimOnly", "SubsurfCube", "SubsurfGridCorners", "SubsurfGridAll", "SubsurfNgon",
+            "SubsurfMonkey", "SubsurfNoLimit", "SubsurfSimple", "SubsurfUV_NONE", "SubsurfUV_SMOOTH_ALL",
+            "SubsurfUV_PRESERVE_CORNERS", "SubsurfCrease10", "SubsurfCrease5", "SubsurfCrease3", "SubsurfCreaseVertex",
+            "Stack"]
 
 
 @pytest.mark.parametrize("name", MODIFIED)
@@ -171,6 +174,31 @@ def test_modifiers_match_blender(modified, name):
     ours, theirs = modified
     assert ours[name][1] == theirs[name][1]  # the same number of triangles
     assert gap(ours[name][0], theirs[name][0]) < TOLERANCE.get(name, 1e-5)
+
+
+def _corner_uvs(scene) -> dict:
+    out = {}
+    for node, w in scene.walk():
+        m = node.mesh
+        if m is not None and m.uvs:
+            out[node.name] = np.hstack([m.positions[m.corners] @ w[:3, :3].T + w[:3, 3], m.uvs[0]])
+    return out
+
+
+@pytest.fixture(scope="module")
+def modified_uvs():
+    return _corner_uvs(meshport.load(DATA / "modifiers.blend")), _corner_uvs(meshport.load(DATA / "modifiers_blender.glb"))
+
+
+# smoothed UV corners (UV Smooth "All") land where Blender's approximation of the limit puts them, as above
+UV_TOLERANCE = {**TOLERANCE, "SubsurfUV_SMOOTH_ALL": 2e-3}
+
+
+@pytest.mark.parametrize("name", [n for n in MODIFIED if not n.startswith("Weld")])  # the Weld grids have no UVs
+def test_modifier_uvs_match_blender(modified_uvs, name):
+    # each corner's point and UV together: subdivided UVs are smoothed as Blender smooths them
+    ours, theirs = modified_uvs
+    assert gap(ours[name], theirs[name]) < UV_TOLERANCE.get(name, 1e-5)
 
 
 def test_unknown_and_hidden_modifiers_are_skipped(modified):

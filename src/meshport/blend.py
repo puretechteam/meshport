@@ -53,6 +53,7 @@ from .scene import (
     Budget,
     Channel,
     Image,
+    Light,
     Material,
     Mesh,
     MeshportError,
@@ -69,7 +70,11 @@ _PRIMITIVE = {"char": "i1", "uchar": "u1", "int8_t": "i1", "uint8_t": "u1", "sho
               "float": "f4", "double": "f8", "int64_t": "i8", "uint64_t": "u8", "long": "i4", "ulong": "u4",
               "bool": "u1"}
 _EULER = {1: "XYZ", 2: "XZY", 3: "YXZ", 4: "YZX", 5: "ZXY", 6: "ZYX"}
-OB_MESH, OB_EMPTY, OB_CURVES_LEGACY, OB_FONT, OB_MBALL, OB_ARMATURE = 1, 0, 2, 4, 5, 25
+OB_MESH, OB_EMPTY, OB_CURVES_LEGACY, OB_FONT, OB_MBALL, OB_LAMP, OB_ARMATURE = 1, 0, 2, 4, 5, 10, 25
+# Light.type and Light.mode; Blender's watts become candela (and W/m^2 lux) at 683 lm/W, as its glTF export has it
+_LIGHT_KINDS = {0: "point", 1: "directional", 2: "spot"}
+_LA_CUSTOM_DISTANCE = 1 << 20
+_LUMENS_PER_WATT = 683.0
 _OB_DUPLICOLLECTION = 1 << 8
 # CustomData layer types (named layers, Blender 3.x and 4.x)
 _CD = {10: ("f4", 1), 11: ("i4", 1), 17: ("u1", 4), 45: ("i1", 1), 46: ("i4", 2), 47: ("f4", 4), 48: ("f4", 3),
@@ -408,6 +413,7 @@ class _Reader:
     def __init__(self, f: _File, base_dir: Path | None, modifiers: bool = True):
         self.f, self.base_dir, self.modifiers = f, base_dir, modifiers
         self.raw: dict[int, tuple[Mesh, np.ndarray] | None] = {}
+        self.capping: set[int] = set()  # objects whose mesh is being made for an Array's cap
         self.meshes: dict[int, Mesh | None] = {}
         self.worlds: dict[int, np.ndarray] = {}
         self.materials: dict[int, Material] = {}
@@ -563,6 +569,8 @@ class _Reader:
             node.mesh, node.materials = got
         elif kind == OB_EMPTY and ob.get("transflag", 0) & _OB_DUPLICOLLECTION:
             node.children += self._instances(ob, set())
+        elif kind == OB_LAMP:
+            node.light = self._light(ob)
         elif kind == OB_ARMATURE:
             arm = self._id(ob.get("data", 0), "bArmature")
             if arm is not None:
@@ -661,7 +669,7 @@ class _Reader:
         modifiers = blendmods.stack(ob) if self.modifiers else []
         if modifiers:  # this object's own copy
             ctx = blendmods.Context(self._world(ob_address, ob, self.worlds), self._world_of, len(slots),
-                                    self.generated)
+                                    self.generated, lambda a: self._cap_mesh(a, ob_address))
             mesh, smooth = blendmods.apply(*raw, modifiers, ctx)
             self.generated.spend(len(mesh.corners))
             return (_finish(mesh, smooth) if len(mesh.face_sizes) else None), slots
@@ -695,6 +703,50 @@ class _Reader:
                                  np.array([float(el.get(k, 1.0)) for k in ("expx", "expy", "expz")])))
         return blendcurve.metaball_mesh(elements, float(mb.get("wiresize", 0.4)), float(mb.get("thresh", 0.6)),
                                         mb.id_name() or "metaball")
+
+    def _cap_mesh(self, address: int, user: int):
+        """A mesh object's (mesh, smooth flags) with its own modifiers applied, for an Array on another
+        object (user) to cap with; None for other kinds of object, the user itself and loops."""
+        ob = self._id(address, "Object")
+        if ob is None or ob.get("type", -1) != OB_MESH or address == user or address in self.capping:
+            return None
+        key = ob.get("data", 0)
+        me = self._id(key, "Mesh")
+        if me is None:
+            return None
+        if key not in self.raw:
+            self.raw[key] = _read_mesh(me)
+        raw = self.raw[key]
+        modifiers = blendmods.stack(ob) if self.modifiers else []
+        if raw is None or not modifiers:
+            return raw
+        self.capping.add(address)
+        try:
+            ctx = blendmods.Context(self._world(address, ob, self.worlds), self._world_of, len(self._slots(ob, me)),
+                                    self.generated, lambda a: self._cap_mesh(a, address))
+            return blendmods.apply(*raw, modifiers, ctx)
+        finally:
+            self.capping.discard(address)
+
+    def _light(self, ob: _S) -> Light | None:
+        """A point, spot or sun light (area lights have no glTF kind and are left out), in glTF's
+        units as Blender's glTF export gives them."""
+        la = self._id(ob.get("data", 0), "Lamp" if "Lamp" in self.f.struct_index else "Light")
+        if la is None:
+            return None
+        kind = _LIGHT_KINDS.get(int(la.get("type", -1)))
+        if kind is None:
+            return None
+        watts = float(la.get("energy_new", la.get("energy", 10.0)) or 0.0) * 2.0 ** float(la.get("exposure", 0.0) or 0.0)
+        per_area = 1.0 if kind == "directional" else 4 * math.pi  # a point's watts spread over the sphere
+        light = Light(la.id_name() or "light", kind, tuple(float(la.get(c, 1.0)) for c in "rgb"),
+                      watts * _LUMENS_PER_WATT / per_area)
+        if int(la.get("mode", 0) or 0) & _LA_CUSTOM_DISTANCE and kind != "directional":
+            light.range = float(la.get("att_dist", 0.0)) or None
+        if kind == "spot":
+            light.outer_cone = float(la.get("spotsize", math.pi / 4)) / 2
+            light.inner_cone = light.outer_cone * (1 - min(max(float(la.get("spotblend", 0.15)), 0.0), 1.0))
+        return light
 
     def _world_of(self, address: int) -> np.ndarray | None:
         ob = self._id(address, "Object")
@@ -828,7 +880,7 @@ def _keep(node: Node, bones: set[int] = frozenset()) -> bool:
     """Whether a node holds anything (a mesh, or a bone a mesh may follow), dropping the children
     that don't."""
     node.children = [c for c in node.children if _keep(c, bones)]
-    return node.mesh is not None or bool(node.children) or id(node) in bones
+    return node.mesh is not None or node.light is not None or bool(node.children) or id(node) in bones
 
 
 def _sockets(node: _S, field: str):
@@ -878,7 +930,7 @@ def _frames(used: list, scene: _S) -> np.ndarray | None:
     """Every key of the curves and every frame between, or None when that's under two frames."""
     keys = np.concatenate([c.keys[:, 1, 0] for c in used])
     lo, hi = float(keys.min()), float(keys.max())
-    if any(c.extend for c in used):  # a curve that carries on: as far as the scene plays
+    if any(c.carries_on for c in used):  # a curve that carries on: as far as the scene plays
         r = scene.get("r")
         if isinstance(r, _S):
             lo, hi = min(lo, float(r.get("sfra", lo))), max(hi, float(r.get("efra", hi)))
@@ -1072,6 +1124,13 @@ def _read_mesh(me: _S) -> tuple[Mesh, np.ndarray] | None:
                 np.asarray(material_index, np.int64).ravel() if material_index is not None else None)
     if not keep.all():
         mesh, smooth = _drop_faces(mesh, keep), smooth[keep]
+    pairs, crease = attrs.get((".edge_verts", _EDGE)), attrs.get(("crease_edge", _EDGE))
+    vert_crease = attrs.get(("crease_vert", _POINT))
+    if pairs is not None and (crease is not None or vert_crease is not None):  # Blender 4.0 on
+        pairs = np.asarray(pairs, np.int64).reshape(-1, 2)
+        crease = np.zeros(len(pairs)) if crease is None else np.asarray(crease, np.float64).ravel()
+        if len(crease) == len(pairs) and (vert_crease is None or len(vert_crease) == nv):
+            mesh.creases = blendmods.Creases.from_blender(pairs, crease, vert_crease)
     return mesh, smooth
 
 

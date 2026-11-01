@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest]  # add ubuntu-latest once the suite has been run on Linux
+        os: [windows-latest, ubuntu-latest]
         python: ["3.10", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:

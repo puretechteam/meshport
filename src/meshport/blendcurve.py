@@ -613,8 +613,9 @@ def _font_dirs() -> list[Path]:
     if local:
         dirs.append(Path(local) / "Microsoft" / "Windows" / "Fonts")
     dirs += [Path("/System/Library/Fonts"), Path("/Library/Fonts"), Path.home() / "Library" / "Fonts",
-             Path("/usr/share/fonts/truetype/dejavu"), Path("/usr/share/fonts/TTF"), Path("/usr/share/fonts/truetype"),
-             Path.home() / ".fonts"]
+             Path("/usr/share/fonts/truetype/dejavu"), Path("/usr/share/fonts/truetype/liberation"),
+             Path("/usr/share/fonts/TTF"), Path("/usr/share/fonts/truetype"), Path("/usr/share/fonts/dejavu"),
+             Path("/usr/local/share/fonts"), Path.home() / ".local" / "share" / "fonts", Path.home() / ".fonts"]
     return dirs
 
 

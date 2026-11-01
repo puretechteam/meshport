@@ -26,9 +26,12 @@ them. Then:
   BlendShapes (offsets, pointIndices, normalOffsets), weighted by the animation's
   blendShapeWeights, matched by name. In-between shapes are left out.
 
-Not handled: curves, points and other animated attributes (animated points open at their first
-time sample). Classes are composed from the layer stacks they're found in;
-relocates aren't read.
+Animated points (a mesh whose points have time samples and whose faces don't change) play as
+USD plays them: each later sample is a blend shape, weighted so the mesh blends linearly from
+sample to sample, up to alembic.CACHE_BUDGET values.
+
+Not handled: curves, points prims and other animated attributes. Classes are composed from the
+layer stacks they're found in; relocates aren't read.
 
 Writing produces a stage Apple's AR Quick Look and usdchecker accept: Y up, meters, a default
 prim, UsdPreviewSurface materials with textures, binary (.usdc) layers inside .usdz packages.
@@ -626,6 +629,7 @@ class _Builder:
         self.images: dict[tuple, Image | None] = {}
         self.uv_names: dict[str, str] = {}  # material path -> the UV set its textures read
         self.animated: list[tuple[Node, str, np.ndarray | None]] = []  # (node, prim, parent world if reset)
+        self.point_caches: list[tuple[Node, np.ndarray]] = []  # meshes with animated points, and their time codes
         # skeleton prim -> (joint tokens, joint nodes, bind transforms or None, its SkelAnimation or None)
         self.skeletons: dict[str, tuple[list[str], list[Node], np.ndarray | None, str | None]] = {}
         self.skinned: list[tuple[Node, str]] = []  # meshes that may be bound to a skeleton
@@ -661,6 +665,10 @@ class _Builder:
                 except DAMAGED:
                     continue  # damaged samples lose this prim's animation, not the file
         channels += [c for c in self.joint_channels if id(c.node) in in_scene]
+        for node, codes in self.point_caches:  # sample k is target k - 1 at full weight, linear between
+            if id(node) in in_scene:
+                weights = np.vstack([np.zeros(len(codes) - 1), np.eye(len(codes) - 1)])
+                channels.append(Channel(node, WEIGHTS, codes / tcps, weights, "LINEAR"))
         for node, path in self.skinned:
             if id(node) not in in_scene:
                 continue
@@ -697,6 +705,7 @@ class _Builder:
                 node.mesh, node.materials = got
                 if type_name == "Mesh":
                     self.skinned.append((node, path))
+                    self._point_samples(node, path)
         if type_name == "Skeleton":
             try:
                 node.children = self._joints(path)
@@ -713,6 +722,30 @@ class _Builder:
         if node.mesh is None and not node.children:
             return None
         return node
+
+    def _point_samples(self, node: Node, path: str) -> None:
+        """A mesh whose points have time samples (and whose faces don't): the first sample as its
+        points, each later one a blend shape that a weights channel plays at its time."""
+        from .alembic import CACHE_BUDGET
+        st, mesh = self.stage, node.mesh
+        samples = st.samples(path, "points")
+        if not samples or len(samples) < 2 or mesh.targets or st.samples(path, "faceVertexCounts") \
+                or st.samples(path, "faceVertexIndices"):
+            return
+        times = sorted(samples)
+        count = len(mesh.positions)
+        if len(times) * count * 3 + len(times) * (len(times) - 1) > CACHE_BUDGET:
+            return
+        try:
+            frames = [np.asarray(samples[t], np.float64).reshape(-1, 3) for t in times]
+        except (TypeError, ValueError):
+            return
+        if any(len(f) != count for f in frames) or not all(np.isfinite(f).all() for f in frames):
+            return
+        mesh.positions = frames[0]
+        mesh.targets = [Morph(f"sample{k}", f - frames[0]) for k, f in enumerate(frames[1:], 1)]
+        mesh.target_weights = np.zeros(len(mesh.targets))
+        self.point_caches.append((node, np.array(times, np.float64)))
 
     def _instances(self, path: str, depth: int) -> list[Node]:
         """A PointInstancer's instances: one node each, placed by the instancer's positions,

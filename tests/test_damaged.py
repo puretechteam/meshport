@@ -224,3 +224,58 @@ def test_gltf_tga_texture_file_is_accepted(tmp_path):
     path = _gltf_folder(tmp_path, _gltf_with("wood.tga"))
     (path.parent / "wood.tga").write_bytes(out.getvalue())
     assert meshport.load(path).roots[0].materials[0].base_color_texture.data == out.getvalue()
+
+
+def _tiny_gltf(positions, indices=None, index_type=5125, node=None) -> bytes:
+    """A one-triangle .gltf with its buffer inline: positions (3 x float32 rows), indices given
+    as raw values in index_type (5126 is float), node: the node's own fields."""
+    import base64
+    import json
+    pos = np.asarray(positions, "<f4").tobytes()
+    idx = np.asarray(indices if indices is not None else [0, 1, 2],
+                     {5125: "<u4", 5126: "<f4"}[index_type]).tobytes()
+    blob = pos + idx
+    doc = {"asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}],
+           "nodes": [{"mesh": 0, **(node or {})}],
+           "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
+           "buffers": [{"byteLength": len(blob),
+                        "uri": "data:application/octet-stream;base64," + base64.b64encode(blob).decode()}],
+           "bufferViews": [{"buffer": 0, "byteLength": len(pos)},
+                           {"buffer": 0, "byteOffset": len(pos), "byteLength": len(idx)}],
+           "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"},
+                         {"bufferView": 1, "componentType": index_type, "count": 3, "type": "SCALAR"}]}
+    return json.dumps(doc).encode()
+
+
+TRIANGLE = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+
+
+@pytest.mark.parametrize("what, data", [
+    ("nan position", lambda: _tiny_gltf([(np.nan, 0, 0), (1, 0, 0), (0, 1, 0)])),
+    ("signalling nan position", lambda: _tiny_gltf(
+        np.frombuffer(struct.pack("<9I", 0x7F800001, *[0] * 8), "<f4").reshape(3, 3))),
+    ("nan index", lambda: _tiny_gltf(TRIANGLE, [0, np.nan, 2], 5126)),
+    ("huge index", lambda: _tiny_gltf(TRIANGLE, [0, 1e30, 2], 5126)),
+    ("fractional index", lambda: _tiny_gltf(TRIANGLE, [0, 0.5, 2], 5126)),
+    ("infinite rotation", lambda: _tiny_gltf(TRIANGLE, node={"rotation": [0, 0, 0, 1e308 * 10]})),
+    ("infinite translation", lambda: _tiny_gltf(TRIANGLE, node={"translation": [1e308 * 10, 0, 0]})),
+    ("nan matrix", lambda: _tiny_gltf(TRIANGLE, node={"matrix": [float("nan")] * 16})),
+])
+def test_gltf_numbers_that_arent_numbers_are_damage(what, data):
+    """NaN, infinite or fractional values where a glTF needs real ones: MeshportError, and no
+    numpy warning on the way (warnings are errors in this suite)."""
+    with pytest.raises(MeshportError, match="damaged"):
+        meshport.read(data(), "gltf")
+
+
+def test_slerp_of_a_zero_quaternion_does_not_warn():
+    from meshport.geometry import slerp
+    out = slerp(np.zeros((1, 4)), np.zeros((1, 4)), 0.5)
+    assert np.isfinite(out).all()
+
+
+@pytest.mark.parametrize("line", ["v nan 0 0", "v inf 0 0", "v 1e999 0 0", "vn 0 nan 1", "vt inf 0"])
+def test_obj_numbers_that_arent_numbers_are_damage(line):
+    text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\nvt 0 0\n" + line + "\nf 1 2 3\n"
+    with pytest.raises(MeshportError, match="damaged"):
+        meshport.read(text.encode(), "obj")

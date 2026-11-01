@@ -12,12 +12,15 @@ doesn't know are skipped and the rest still applied.
 - Mirror: any axes, merging along the seam (to the midpoint), bisecting, a mirror object, and
   flipped and offset UVs.
 - Array: fixed count or fit length, relative, constant and object offsets, merging (also of the
-  last copy with the first) and UV offsets. Caps and fit-to-curve aren't applied.
+  last copy with the first), UV offsets, and start and end caps (merged with the ends too).
+  Fit-to-curve isn't applied.
 - Solidify: simple mode with even thickness, rims, flipped normals, rim-only, and material
   offsets. Complex mode is approximated by simple mode with even thickness.
 - Subdivision Surface: Catmull-Clark or simple at the viewport level, boundaries kept sharp (with
   "Keep Corners" or smoothed corners) and points pushed to the limit surface as Blender does.
-  UVs and colors are interpolated linearly; edge creases are ignored.
+  UVs are smoothed as a mesh of their own (split along seams), with its boundaries kept as
+  the UV Smooth setting says; colors are interpolated linearly. Edge and vertex creases (Blender
+  4.0 on) are OpenSubdiv's semi-sharp creases, resolved to the Quality level as Blender does.
 
 Vertex groups (which can scale some of these) are ignored.
 """
@@ -42,19 +45,24 @@ _ARR_FIT_LENGTH = 1
 # SolidifyModifierData.flag
 _SOL_RIM, _SOL_EVEN, _SOL_FLIP, _SOL_NO_SHELL = 1, 2, 32, 64
 # SubsurfModifierData
-_SUB_NO_LIMIT = 64
+_SUB_NO_LIMIT, _SUB_USE_CREASE = 64, 16
 _SUB_SIMPLE = 1
 _SUB_KEEP_CORNERS = 1
+# SubsurfModifierData.uv_smooth: none (linear), keep corners, ... keep boundaries (the default), all
+_UV_SMOOTH_NONE, _UV_KEEP_CORNERS, _UV_KEEP_BOUNDARIES, _UV_SMOOTH_ALL = 0, 1, 4, 5
 _FLT_EPSILON = 1.1920929e-07
 
 
 class Context:
     """What modifiers need from outside the mesh: the object's world matrix (Blender's axes),
-    other objects' world matrices by address, and the number of material slots."""
+    other objects' world matrices and meshes (modifiers applied, as (mesh, smooth) or None) by
+    address, and the number of material slots."""
 
-    def __init__(self, ob_world: np.ndarray, world_of, n_materials: int, budget: Budget | None = None):
+    def __init__(self, ob_world: np.ndarray, world_of, n_materials: int, budget: Budget | None = None,
+                 mesh_of=None):
         self.ob_world, self.world_of, self.n_materials = ob_world, world_of, n_materials
         self.budget = budget or Budget(MAX_GENERATED, "This mesh is too big once its modifiers are applied")
+        self.mesh_of = mesh_of or (lambda address: None)
 
     def relative(self, address: int) -> np.ndarray | None:
         """Another object's matrix in this object's space, or None if it isn't there."""
@@ -507,35 +515,68 @@ def _array(mesh: Mesh, smooth: np.ndarray, md, ctx: Context):
         length = float(md.get("length", 0.0))
         count = int(length / dist * (1 + 1e-5)) + 1 if dist > _FLT_EPSILON else 1  # an exact fit counts
     count = max(1, min(count, 1_000_000 // max(len(p), 1) + 1))
-    if count == 1:
+    # caps: other objects' meshes, as they are in their own space, one step before the first copy and
+    # one past the last (Blender doesn't look at where the cap objects themselves stand)
+    caps = [ctx.mesh_of(int(md.get(field, 0) or 0)) for field in ("start_cap", "end_cap")]
+    if count == 1 and caps == [None, None]:
         return mesh, smooth
-    ctx.budget.need(count * len(mesh.corners))
+    ctx.budget.need(count * len(mesh.corners) + sum(len(c[0].corners) for c in caps if c is not None))
     uv_offset = np.asarray(md.get("uv_offset", np.zeros(2)), np.float64)
     copies, matrix = [], np.eye(4)
     for k in range(count):
         copies.append(_copy(mesh, transform_points(matrix, p), uvs=[u + uv_offset * k for u in mesh.uvs]))
         matrix = step @ matrix
-    joined, joined_smooth = _concat(copies, [smooth] * count)
     n = len(p)
-    target = np.arange(n * count)
+    parts, smooths = list(copies), [smooth] * count
+    placed = []  # (first point, cap points, the copy it meets)
+    for cap, place, meets in zip(caps, (np.linalg.inv(step), matrix), (0, count - 1)):
+        if cap is None:
+            continue
+        cap_mesh = _like(cap[0], mesh, ctx.n_materials)
+        cap_mesh.positions = transform_points(place, cap_mesh.positions)
+        placed.append((sum(len(m.positions) for m in parts), cap_mesh.positions, meets))
+        parts.append(cap_mesh)
+        smooths.append(np.asarray(cap[1], bool))
+    joined, joined_smooth = _concat(parts, smooths)
+    target = np.arange(len(joined.positions))
     flags = int(md.get("flags", 0))
     dist = float(md.get("merge_dist", 0.01))
-    if flags & _ARR_MERGE:
+    if flags & _ARR_MERGE and count > 1:
         # each point of the second copy that lands on one of the first: the same for every later pair
         src, dst = _nearest(copies[1].positions, copies[0].positions, dist)
         for k in range(1, count):
             target[k * n + src] = (k - 1) * n + dst
-    if flags & _ARR_MERGE_FINAL:
+    if flags & _ARR_MERGE_FINAL and count > 1:
         src, dst = _nearest(copies[-1].positions, copies[0].positions, dist)
         target[(count - 1) * n + src] = dst
-    for _ in range(count + 1):  # follow chains of merges to their end
+    if flags & _ARR_MERGE:
+        for start, points, meets in placed:  # a cap's points merge onto the copy it meets
+            src, dst = _nearest(points, copies[meets].positions, dist)
+            target[start + src] = meets * n + dst
+    for _ in range(count + 3):  # follow chains of merges to their end
         nxt = target[target]
         if (nxt == target).all():
             break
         target = nxt
-    if (target == np.arange(n * count)).all():
+    if (target == np.arange(len(target))).all():
         return joined, joined_smooth
     return _rebuild(joined, joined_smooth, target, joined.positions, drop_mapped=True)
+
+
+def _like(cap: Mesh, mesh: Mesh, n_materials: int) -> Mesh:
+    """A copy of cap with mesh's UV sets and colors (zero UVs and white where cap has none), and its
+    material numbers kept within the object's slots."""
+    c = len(cap.corners)
+    uvs = [cap.uvs[k] if k < len(cap.uvs) else np.zeros((c, 2)) for k in range(len(mesh.uvs))]
+    colors = None
+    if mesh.colors is not None:
+        colors = cap.colors if cap.colors is not None else np.ones((c, 4))
+    mats = _materials(cap)
+    if mesh.face_materials is not None or mats.any():
+        mats = np.minimum(mats, max(n_materials - 1, 0))
+    else:
+        mats = None
+    return Mesh(cap.name, cap.positions.copy(), cap.face_sizes, cap.corners, None, uvs, colors, mats)
 
 
 def _nearest(src: np.ndarray, dst: np.ndarray, dist: float) -> tuple[np.ndarray, np.ndarray]:
@@ -616,55 +657,155 @@ def _subsurf(mesh: Mesh, smooth: np.ndarray, md, ctx: Context):
     levels = min(int(md.get("levels", 1)), 6)
     simple = int(md.get("subdivType", 0)) == _SUB_SIMPLE
     keep_corners = int(md.get("boundary_smooth", 0)) == _SUB_KEEP_CORNERS
+    limit = levels > 0 and not simple and not int(md.get("flags", 0)) & _SUB_NO_LIMIT
+    uv_smooth = int(md.get("uv_smooth", _UV_KEEP_BOUNDARIES))
+    uv_pin = {_UV_KEEP_BOUNDARIES: "boundary", _UV_SMOOTH_ALL: keep_corners}.get(uv_smooth, True)
+    uvs = mesh.uvs if not simple and uv_smooth != _UV_SMOOTH_NONE else []
+    sizes, corners = mesh.face_sizes, mesh.corners
+    creases = getattr(mesh, "creases", None) if int(md.get("flags", 0)) & _SUB_USE_CREASE else None
     for _ in range(levels):
         ctx.budget.need(4 * len(mesh.corners))  # each corner becomes a quad
-        mesh, smooth = _subdivide(mesh, smooth, simple, keep_corners)
-    if levels > 0 and not simple and not int(md.get("flags", 0)) & _SUB_NO_LIMIT:
-        mesh.positions = _limit(mesh, keep_corners)
+        mesh, smooth, creases = _subdivide(mesh, smooth, simple, keep_corners, creases)
+    if limit:
+        extra = int(md.get("quality", 3)) - levels
+        fine = mesh
+        if creases is not None and extra > 0 and (creases.values.size or (creases.points is not None
+                                                                         and creases.points.any())):
+            # Blender's limit resolves creases down to its Quality level: refine that far (for the
+            # creases' sake only; points keep their numbers) and take the limit of this level's points
+            for _ in range(extra):
+                ctx.budget.need(4 * len(fine.corners))
+                fine, _, creases = _subdivide(fine, np.ones(len(fine.face_sizes), bool), False, keep_corners,
+                                              creases)
+        mesh.positions = _limit(fine, keep_corners, creases)[:len(mesh.positions)]
+    if levels > 0 and uvs:
+        mesh.uvs = [_smooth_uvs(sizes, corners, uv, levels, uv_pin, limit) for uv in uvs]
     return mesh, smooth
 
 
-def _sharpness(mesh: Mesh, nxt: np.ndarray, keep_corners: bool):
-    """Edges, each corner's edge, which edges are sharp (boundary or shared by over two faces),
-    and for each vertex: its sharp-edge count, the sum of the far ends of its sharp edges, its
-    edge count and whether it's pinned (three or more sharp edges, or a kept corner)."""
+def _smooth_uvs(sizes, corners, uv, levels: int, pin, limit: bool) -> np.ndarray:
+    """A UV layer subdivided as Catmull-Clark subdivides the mesh, over its own points (a mesh
+    point with several UVs, along a seam, is several UV points), so seams are boundaries. pin is
+    "boundary" (boundary points stay and boundary edges stay straight), True (corners stay) or
+    False. The corners come out in the order the mesh's own subdivision gives them."""
+    _, index = unique_rows(np.column_stack([corners.astype(np.float64), uv]))
+    first = np.zeros(int(index.max()) + 1, np.int64)
+    first[index] = np.arange(len(index))
+    flat = Mesh("uv", np.column_stack([uv[first], np.zeros(len(first))]), sizes, index.astype(np.int64))
+    smooth = np.ones(len(sizes), bool)
+    for _ in range(levels):
+        flat, smooth, _ = _subdivide(flat, smooth, False, pin)
+    if limit:
+        flat.positions = _limit(flat, pin)
+    return flat.positions[flat.corners, :2]
+
+
+_KEY = 1 << 31  # an edge's key: lower point * _KEY + higher point
+
+
+def _edge_keys(pairs: np.ndarray) -> np.ndarray:
+    pairs = np.asarray(pairs, np.int64).reshape(-1, 2)
+    return np.minimum(pairs[:, 0], pairs[:, 1]) * _KEY + np.maximum(pairs[:, 0], pairs[:, 1])
+
+
+class Creases:
+    """Semi-sharp creases as OpenSubdiv has them: a sharpness per edge (by its two points) and
+    per point, each losing 1 a level. Blender's crease c is a sharpness of 10 c^2."""
+
+    def __init__(self, keys: np.ndarray, values: np.ndarray, points: np.ndarray | None = None):
+        order = np.argsort(keys)
+        self.keys, self.values, self.points = keys[order], values[order], points
+
+    @classmethod
+    def from_blender(cls, pairs, edge_crease, vert_crease=None):
+        values = 10.0 * np.clip(np.asarray(edge_crease, np.float64).ravel(), 0, 1) ** 2
+        keep = values > 0
+        points = None
+        if vert_crease is not None:
+            points = 10.0 * np.clip(np.asarray(vert_crease, np.float64).ravel(), 0, 1) ** 2
+        return cls(_edge_keys(pairs)[keep], values[keep], points)
+
+    def on(self, edges: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
+        """The sharpness of each of these edges, and of each of the n points."""
+        found = np.zeros(len(edges))
+        if len(self.keys) and len(edges):
+            keys = _edge_keys(edges)
+            at = np.clip(np.searchsorted(self.keys, keys), 0, len(self.keys) - 1)
+            hit = self.keys[at] == keys
+            found[hit] = self.values[at[hit]]
+        points = np.zeros(n)
+        if self.points is not None:
+            m = min(n, len(self.points))
+            points[:m] = self.points[:m]
+        return found, points
+
+
+def _less(sharpness: np.ndarray) -> np.ndarray:
+    """A level down: 1 less, and nothing once it's at 1 or under (OpenSubdiv's uniform rule)."""
+    return np.where(sharpness > 1, sharpness - 1, 0.0)
+
+
+def _sharpness(mesh: Mesh, nxt: np.ndarray, keep_corners, creases: Creases | None = None):
+    """Edges, each corner's edge, each edge's sharpness (infinite on a boundary or an edge shared
+    by over two faces, else its crease), each point's edge count and sharpness, and which points
+    are pinned (a kept corner; with keep_corners "boundary", every point on a boundary)."""
     edges, corner_edge = _edges(mesh.corners, nxt)
     n = len(mesh.positions)
     uses = np.bincount(corner_edge, minlength=len(edges))
-    sharp = uses != 2
+    boundary = uses != 2
+    if creases is not None:
+        edge_sharp, point_sharp = creases.on(edges, n)
+    else:
+        edge_sharp, point_sharp = np.zeros(len(edges)), np.zeros(n)
+    edge_sharp = np.where(boundary, np.inf, edge_sharp)
     ends = edges.ravel()
     valence = np.bincount(ends, minlength=n)
-    sharp_count = np.bincount(ends, np.repeat(sharp, 2), n).astype(np.int64)
+    boundary_count = np.bincount(ends, np.repeat(boundary, 2), n).astype(np.int64)
+    pinned = np.zeros(n, bool)
+    if keep_corners == "boundary":
+        pinned = boundary_count > 0
+    elif keep_corners:
+        faces_at = np.bincount(mesh.corners, minlength=n)
+        pinned = (faces_at == 1) & (boundary_count == 2)
+    return edges, corner_edge, edge_sharp, valence, point_sharp, pinned
+
+
+def _rule(edges, edge_sharp, point_sharp, pinned, p):
+    """Each point's rule (0 smooth, 1 crease, 2 corner) and the sum of its sharp edges' far ends."""
+    n = len(p)
+    sharp = edge_sharp > 0
+    count = np.bincount(edges.ravel(), np.repeat(sharp, 2), n)
+    rule = np.where((count > 2) | (point_sharp > 0) | pinned, 2, np.where(count == 2, 1, 0))
     far = np.zeros((n, 3))
     se = edges[sharp]
     for k in range(3):
-        far[:, k] = (np.bincount(se[:, 0], mesh.positions[se[:, 1], k], n)
-                     + np.bincount(se[:, 1], mesh.positions[se[:, 0], k], n))
-    pinned = sharp_count > 2
-    if keep_corners:
-        faces_at = np.bincount(mesh.corners, minlength=n)
-        pinned |= (faces_at == 1) & (sharp_count == 2)
-    return edges, corner_edge, sharp, valence, sharp_count, far, pinned
+        far[:, k] = np.bincount(se[:, 0], p[se[:, 1], k], n) + np.bincount(se[:, 1], p[se[:, 0], k], n)
+    return rule, far
 
 
-def _subdivide(mesh: Mesh, smooth: np.ndarray, simple: bool, keep_corners: bool):
+def _subdivide(mesh: Mesh, smooth: np.ndarray, simple: bool, keep_corners, creases: Creases | None = None):
+    """One level, and the creases a level down (on the new points), or None."""
     p, sizes, corners = mesh.positions, mesh.face_sizes, mesh.corners
     face, nxt, prv = _topology(sizes)
     nf, n = len(sizes), len(p)
-    edges, corner_edge, sharp, valence, sharp_count, far, pinned = _sharpness(mesh, nxt, keep_corners)
+    edges, corner_edge, edge_sharp, valence, point_sharp, pinned = _sharpness(mesh, nxt, keep_corners, creases)
     ne = len(edges)
     face_pt = np.zeros((nf, 3))
     for k in range(3):
         face_pt[:, k] = np.bincount(face, p[corners, k], nf) / sizes
     mid = (p[edges[:, 0]] + p[edges[:, 1]]) / 2
+    child_edge, child_point = _less(edge_sharp), _less(point_sharp)
     if simple:
         edge_pt, vert_pt = mid, p
     else:
         fsum = np.zeros((ne, 3))
         for k in range(3):
             fsum[:, k] = np.bincount(corner_edge, face_pt[face, k], ne)
-        edge_pt = np.where(sharp[:, None], mid, (p[edges[:, 0]] + p[edges[:, 1]] + fsum) / 4)
-        # vertices: Catmull-Clark's (F + 2R + (n - 3)V) / n inside, (a + 6V + b) / 8 along a sharp line
+        # an edge under 1 sharp blends the smooth point with the midpoint by its sharpness
+        w = np.clip(edge_sharp, 0, 1)[:, None]
+        smooth_edge = (p[edges[:, 0]] + p[edges[:, 1]] + fsum) / 4
+        edge_pt = np.where(edge_sharp[:, None] >= 1, mid, w * mid + (1 - w) * smooth_edge)
+        # vertices: Catmull-Clark's (F + 2R + (n - 3)V) / n smooth, (a + 6V + b) / 8 on a crease, corners stay
         faces_at = np.bincount(corners, minlength=n).astype(np.float64)
         f_avg = np.zeros((n, 3))
         r_avg = np.zeros((n, 3))
@@ -675,9 +816,23 @@ def _subdivide(mesh: Mesh, smooth: np.ndarray, simple: bool, keep_corners: bool)
         r_avg /= np.maximum(valence, 1)[:, None]
         val = np.maximum(valence, 1)[:, None].astype(np.float64)
         smooth_pt = (f_avg + 2 * r_avg + (val - 3) * p) / val
-        crease_pt = (far + 6 * p) / 8
-        vert_pt = np.where((sharp_count >= 2)[:, None], crease_pt, smooth_pt)
-        vert_pt = np.where(pinned[:, None], p, vert_pt)
+
+        def by_rule(rule, far):
+            return np.where((rule == 2)[:, None], p, np.where((rule == 1)[:, None], (far + 6 * p) / 8, smooth_pt))
+
+        rule, far = _rule(edges, edge_sharp, point_sharp, pinned, p)
+        vert_pt = by_rule(rule, far)
+        child_rule, child_far = _rule(edges, child_edge, child_point, pinned, p)
+        change = rule != child_rule
+        if change.any():  # a crease running out: blend the two rules by the sharpness that runs out
+            fading = (edge_sharp > 0) & (child_edge <= 0)
+            total = np.bincount(edges.ravel(), np.repeat(np.where(fading, edge_sharp, 0.0), 2), n)
+            count = np.bincount(edges.ravel(), np.repeat(fading, 2), n).astype(np.float64)
+            point_fading = (point_sharp > 0) & (child_point <= 0)
+            total, count = total + np.where(point_fading, point_sharp, 0), count + point_fading
+            weight = np.clip(np.divide(total, count, out=np.zeros(n), where=count > 0), 0, 1)[:, None]
+            blended = weight * vert_pt + (1 - weight) * by_rule(child_rule, child_far)
+            vert_pt = np.where(change[:, None], blended, vert_pt)
         vert_pt = np.where((valence == 0)[:, None], p, vert_pt)
     positions = np.concatenate([vert_pt, edge_pt, face_pt])
     # one quad per corner: the corner's point, its next edge's point, the face's point, its previous edge's point
@@ -693,17 +848,23 @@ def _subdivide(mesh: Mesh, smooth: np.ndarray, simple: bool, keep_corners: bool)
     out = Mesh(mesh.name, positions, np.full(len(corners), 4, np.int64), quad.astype(np.int64), None,
                [corner_attr(u) for u in mesh.uvs], corner_attr(mesh.colors) if mesh.colors is not None else None,
                mesh.face_materials[face] if mesh.face_materials is not None else None)
-    return out, np.asarray(smooth, bool)[face]
+    next_creases = None
+    if creases is not None:  # each creased edge's two halves keep its sharpness, a level down
+        e = np.nonzero(np.isfinite(child_edge) & (child_edge > 0))[0]
+        halves = np.concatenate([np.stack([edges[e, 0], n + e], 1), np.stack([n + e, edges[e, 1]], 1)])
+        points = np.concatenate([child_point, np.zeros(ne + nf)])
+        next_creases = Creases(_edge_keys(halves), np.concatenate([child_edge[e], child_edge[e]]), points)
+    return out, np.asarray(smooth, bool)[face], next_creases
 
 
-def _limit(mesh: Mesh, keep_corners: bool) -> np.ndarray:
+def _limit(mesh: Mesh, keep_corners, creases: Creases | None = None) -> np.ndarray:
     """Points moved to Catmull-Clark's limit surface (all faces are quads after a level):
-    (n²V + 4·Σ edge neighbours + Σ diagonal neighbours) / (n(n + 5)) inside, (a + 4V + b) / 6
-    along a sharp line, and pinned points stay."""
+    (n^2 V + 4 * edge neighbours + diagonal neighbours) / (n(n + 5)) smooth, (a + 4V + b) / 6
+    on a crease (with any sharpness left), and corners stay."""
     p, corners = mesh.positions, mesh.corners
     _, nxt, _ = _topology(mesh.face_sizes)
     n = len(p)
-    edges, _, _, valence, sharp_count, far, pinned = _sharpness(mesh, nxt, keep_corners)
+    edges, _, edge_sharp, valence, point_sharp, pinned = _sharpness(mesh, nxt, keep_corners, creases)
     e_sum = np.zeros((n, 3))
     d_sum = np.zeros((n, 3))
     diag = corners[nxt[nxt]]
@@ -712,9 +873,8 @@ def _limit(mesh: Mesh, keep_corners: bool) -> np.ndarray:
         d_sum[:, k] = np.bincount(corners, p[diag, k], n)
     val = np.maximum(valence, 1)[:, None].astype(np.float64)
     smooth_pt = (val * val * p + 4 * e_sum + d_sum) / (val * (val + 5))
-    crease_pt = (far + 4 * p) / 6
-    out = np.where((sharp_count >= 2)[:, None], crease_pt, smooth_pt)
-    out = np.where(pinned[:, None], p, out)
+    rule, far = _rule(edges, edge_sharp, point_sharp, pinned, p)
+    out = np.where((rule == 2)[:, None], p, np.where((rule == 1)[:, None], (far + 4 * p) / 6, smooth_pt))
     return np.where((valence == 0)[:, None], p, out)
 
 

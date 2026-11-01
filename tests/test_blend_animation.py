@@ -23,17 +23,14 @@ def test_every_object_moves_as_in_blender(name):
         ref = json.load(f)
     scene = blend.read_file(DATA / f"{name}.blend", modifiers=False)
     (anim,) = scene.animations
-    assert len({c.node.name for c in anim.channels}) == 49
+    assert len({c.node.name for c in anim.channels}) == len(next(iter(ref["poses"].values())))
     for frame, objects in ref["poses"].items():
         frame = int(frame)
         ours = {n.name: w for n, w in scene.walk_at(frame / ref["fps"])}  # frame f is f / fps seconds
         for obj, m in objects.items():
-            if obj.startswith("ELASTIC"):  # Blender scales the wobble by the key's amplitude
-                continue
-            if obj == "Extrapolated" and not ref["start"] <= frame <= ref["end"]:
+            if obj.startswith(("Extrapolated", "Mod")) and not ref["start"] <= frame <= ref["end"]:
                 continue  # a curve that carries on is followed as far as the scene plays
-            tolerance = 0.01 if obj.startswith("EXPO") else 1e-4  # Blender's exponential differs by 0.1%
-            assert ours[obj] == pytest.approx(Z_UP @ np.array(m), abs=tolerance), (obj, frame)
+            assert ours[obj] == pytest.approx(Z_UP @ np.array(m), abs=1e-4), (obj, frame)
 
 
 def test_glb_keeps_a_blend_files_animation():

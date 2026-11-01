@@ -94,6 +94,41 @@ child.parent = parent
 child.matrix_parent_inverse = parent.matrix_world.inverted()
 keys(child, "location", [(1, (child.location.x, 2, 0)), (40, (child.location.x, 2, 3))])
 
+
+def curves_of(obj):
+    action = obj.animation_data.action
+    if hasattr(action, "fcurves") and len(action.fcurves):
+        return list(action.fcurves)
+    return [c for layer in action.layers for strip in layer.strips for bag in strip.channelbags for c in bag.fcurves]
+
+
+def modified(label, kind, **settings):
+    """A cube whose location curves carry an F-curve modifier (names start with "Mod")."""
+    ob = add("cube", label)
+    x = ob.location.x
+    keys(ob, "location", [(5, (x, 0, 0)), (11, (x, 1, 2)), (16, (x, 0.5, 1))])
+    for curve in curves_of(ob):
+        m = curve.modifiers.new(kind)
+        for key, value in settings.items():
+            setattr(m, key, value)
+    return ob
+
+
+# F-curve modifiers, among them settings older Blenders also have
+modified("ModCycles", "CYCLES")
+modified("ModCyclesOffset", "CYCLES", mode_before="REPEAT_OFFSET", mode_after="REPEAT_OFFSET")
+modified("ModCyclesMirror", "CYCLES", mode_before="MIRROR", mode_after="MIRROR", cycles_after=2, cycles_before=1)
+modified("ModStepped", "STEPPED", frame_step=3.0, frame_offset=1.0)
+modified("ModLimits", "LIMITS", use_max_y=True, max_y=1.5, use_min_x=True, min_x=7.0)
+modified("ModGenerator", "GENERATOR", use_additive=True, poly_order=2, coefficients=(0.5, 0.05, 0.002))
+modified("ModFactorised", "GENERATOR", mode="POLYNOMIAL_FACTORISED", poly_order=2, coefficients=(0.1, -1, 0.05, 0.5))
+modified("ModRange", "CYCLES", use_restricted_range=True, frame_start=18, frame_end=34, blend_in=3, blend_out=2,
+         use_influence=True, influence=0.7)
+ob = modified("ModStack", "CYCLES", mode_after="REPEAT_OFFSET")
+for curve in curves_of(ob):
+    m = curve.modifiers.new("STEPPED")
+    m.frame_step = 2.0
+
 bpy.ops.wm.save_as_mainfile(filepath=str(out / f"{name}.blend"), compress=True)
 poses = {}
 for frame in sorted({*range(-5, 51, 3), 1, 2, 10, 11, 12, 20, 21, 25, 30, 39, 40, 41, 50}):
