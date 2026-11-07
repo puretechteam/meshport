@@ -594,13 +594,6 @@ class _Stage:
         prim, _, prop = target.rpartition(".")
         return prim, prop
 
-    def source_of(self, path: str, name: str) -> _Source | None:
-        for s in self.sites(path):
-            spec = s.spec(property_path(s.path, name))
-            if spec is not None and ("default" in spec.fields or "timeSamples" in spec.fields):
-                return s.source
-        return None
-
     def defined(self, path: str) -> bool:
         """Some opinion defines it ("def"), and it isn't an abstract class."""
         specifiers = [s.field("specifier") for s in self.sites(path)]
@@ -1466,7 +1459,7 @@ def _implicit(type_name: str, st: _Stage, path: str) -> Mesh | None:
         quads = [[0, 1, 3, 2], [4, 6, 7, 5], [0, 4, 5, 1], [2, 3, 7, 6], [0, 2, 6, 4], [1, 5, 7, 3]]
         return Mesh(name, p, np.full(6, 4), np.array(quads).ravel())
     if type_name == "Sphere":
-        return _revolve(name, _sphere_profile(num("radius", 1.0)), "Y", round_cap=True)
+        return _revolve(name, _sphere_profile(num("radius", 1.0)), "Y")
     if type_name in ("Cylinder", "Cylinder_1"):
         r, h = num("radius", 1.0), num("height", 2.0)
         return _revolve(name, [(0, -h / 2), (r, -h / 2), (r, h / 2), (0, h / 2)], axis)
@@ -1493,7 +1486,7 @@ def _sphere_profile(r: float) -> list:
     return [(r * np.sin(t), -r * np.cos(t)) for t in np.linspace(0, np.pi, 13)]
 
 
-def _revolve(name: str, profile, axis: str, segments: int = 24, round_cap: bool = False) -> Mesh:
+def _revolve(name: str, profile, axis: str, segments: int = 24) -> Mesh:
     """A surface of revolution: profile is (radius, height) points from bottom to top."""
     prof = np.array(profile, float)
     ang = np.linspace(0, 2 * np.pi, segments, endpoint=False)

@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 # spec kinds (SdfSpecType)
-SPEC_ATTRIBUTE, SPEC_PRIM, SPEC_PSEUDO_ROOT, SPEC_RELATIONSHIP, SPEC_VARIANT, SPEC_VARIANT_SET = 1, 6, 7, 8, 10, 11
+SPEC_ATTRIBUTE, SPEC_PRIM, SPEC_PSEUDO_ROOT, SPEC_RELATIONSHIP, SPEC_VARIANT = 1, 6, 7, 8, 10
 
 
 @dataclass(eq=False)

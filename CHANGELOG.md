@@ -2,6 +2,10 @@
 
 Newest first. Each entry is dated by when it landed.
 
+## 2026-11-05: meshport 0.4.1, unused code removed
+
+- **Removed code nothing used,** with no change to what meshport reads or writes: `source_of` and `_revolve`'s `round_cap` in USD, and constants nothing looks at. The suite gives the same results.
+
 ## 2026-11-01: meshport 0.4.0, OBJ reading, lights, ASCII FBX, creases and F-curve modifiers
 
 - **Added: OBJ reading** (`.obj` with its `.mtl` files and textures). Each object (`o`, or `g` in a file without objects) becomes a node: polygons, normals, a UV set, vertex colors (sRGB in the file), negative indices and joined lines, and materials with base color, opacity, emissive, roughness, metallic and their textures. Smoothing groups shade a file without normals as Blender does. Blender's own OBJ files, read back by Blender, give the same points, normals, UVs, colors and materials as meshport, within 0.0002, on 12 objects. A 64 MB, million-triangle OBJ reads in 1.9 s; trimesh takes 9.5 s.
