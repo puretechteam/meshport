@@ -772,7 +772,7 @@ def _text_splines(cu, base_dir: Path | None) -> list[_Spline]:
         unit = 1.0 / max(int(head.yMax) - int(head.yMin), 1)  # Blender scales glyphs by the font's height
         if builtin:
             unit = _BUILTIN_CAP_HEIGHT / _cap_height(font, glyphs, cmap)
-    except Exception:
+    except Exception:  # noqa: BLE001 - a damaged or unsupported font: no text
         return []
     size = float(cu.get("fsize", 1.0))
     scale = unit * size
@@ -799,7 +799,7 @@ def _text_splines(cu, base_dir: Path | None) -> list[_Spline]:
                 pen = _outline_pen(glyphs)
                 try:
                     glyph.draw(pen)
-                except Exception:
+                except Exception:  # noqa: BLE001 - a broken glyph is left out
                     pen.contours = []
                 placed.append((pen.contours, x, infos[k] if k < len(infos) else 0))
             x += advance + extra

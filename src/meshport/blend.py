@@ -98,7 +98,7 @@ def _decompress(data: bytes, limit: int | None = None) -> bytes:
         return _inflate(data, limit, head)
     except MeshportError:
         raise
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - each decompressor has its own error types
         raise MeshportError(f"This .blend file is damaged (its compressed data is broken: {e})") from None
 
 

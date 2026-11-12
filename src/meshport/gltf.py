@@ -916,5 +916,5 @@ def _to_png(data: bytes) -> tuple[bytes | None, str | None]:
             out = io.BytesIO()
             im.save(out, "PNG")
             return out.getvalue(), "image/png"
-    except Exception:
+    except Exception:  # noqa: BLE001 - an unreadable texture shouldn't sink the whole model
         return None, None
