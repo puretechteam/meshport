@@ -169,8 +169,8 @@ def test_texture_at_an_absolute_path_still_loads(tmp_path, scene):
 
 def test_network_texture_paths_are_never_opened(tmp_path, scene, monkeypatch):
     opened = []
-    real = fbx.read_image_file
-    monkeypatch.setattr(fbx, "read_image_file", lambda p: opened.append(str(p)) or real(p))
+    real = meshport.scene.read_image_file  # what the texture finder (in scene, shared by the readers) opens with
+    monkeypatch.setattr(meshport.scene, "read_image_file", lambda p: opened.append(str(p)) or real(p))
     (tmp_path / "box.fbx").write_bytes(fbx.write(_with_texture(scene, r"\\attacker.example\share\wood.png")))
     meshport.load(tmp_path / "box.fbx")
     assert opened and not any(p.replace("\\", "/").startswith("//") for p in opened)

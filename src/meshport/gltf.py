@@ -10,6 +10,7 @@ or .gltf with the buffer and images embedded as data URIs.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import io
 import json
 import math
@@ -38,6 +39,7 @@ from .scene import (
     Node,
     Scene,
     Skin,
+    linked_path,
     node_budget,
     read_image_file,
 )
@@ -129,8 +131,9 @@ class _Reader:
 
     def _uri(self, uri: str, image: bool = False) -> bytes:
         """A buffer or image the file points to. Only relative paths are followed: buffers must
-        be in the model's folder, and images anywhere relative to it but actually images. So a
-        hostile file can't copy other files on the computer into the output."""
+        be in the model's folder, and images (which must really be images) in it or the folder
+        above, as every other reader has it. So a hostile file can't copy other files on the
+        computer into the output."""
         if uri.startswith("data:"):
             return base64.b64decode(uri.split(",", 1)[1])
         if self.base_dir is None:
@@ -142,6 +145,8 @@ class _Reader:
         if not path.is_file():
             raise MeshportError(f"This glTF file needs {rel} next to it, and it's missing")
         if image:
+            if linked_path(rel, self.base_dir) is None:
+                raise MeshportError(f"This glTF file's image {rel} is outside its folder and the one above")
             data = read_image_file(path)
             if data is None:
                 raise MeshportError(f"{rel} isn't an image")
@@ -223,8 +228,7 @@ class _Reader:
             used = {c for n in nodes for c in n.get("children", [])}
             roots = [i for i in range(len(nodes)) if i not in used]
         self._check_size(roots)
-        built: dict[int, Node] = {}
-        scene = Scene([self._node(i, built, set()) for i in roots])
+        scene = Scene([self._tree(i) for i in roots])
         if not scene.meshes:
             raise MeshportError("No 3D geometry found in this file")
         for node, skin, mesh in self._skinned:  # once every joint is built
@@ -285,9 +289,27 @@ class _Reader:
                 stack += [(c, False) for c in kids(i)]
         budget.spend(min(sum(size.get(r, 0) for r in roots if type(r) is int), cap))
 
-    def _node(self, i: int, built: dict, path: set) -> Node:
-        if i in path:
-            raise MeshportError("This glTF file's node hierarchy loops back on itself")
+    def _tree(self, root: int) -> Node:
+        """The node and everything under it, built in a loop rather than by recursion (a scene can be thousands of
+        nodes deep), in the same order recursion would build them."""
+        path: set[int] = set()
+        top: list[Node] = []
+        stack: list[tuple[int, Node | None, bool]] = [(root, None, False)]
+        while stack:
+            i, parent, leaving = stack.pop()
+            if leaving:
+                path.discard(i)
+                continue
+            if i in path:
+                raise MeshportError("This glTF file's node hierarchy loops back on itself")
+            node = self._node(i)
+            (parent.children if parent is not None else top).append(node)
+            path.add(i)
+            stack.append((i, None, True))
+            stack += [(c, node, False) for c in reversed(self._list("nodes")[i].get("children", []))]
+        return top[0]
+
+    def _node(self, i: int) -> Node:
         data = self._list("nodes")[i]
         if "matrix" in data:
             matrix = np.array(data["matrix"], np.float64).reshape(4, 4).T
@@ -308,13 +330,13 @@ class _Reader:
                 node.mesh, node.materials = got
                 weights = data.get("weights")  # a node's own weights for its mesh's targets
                 if isinstance(weights, list) and len(weights) == len(node.mesh.targets) and weights:
-                    node.mesh.target_weights = np.array(weights, np.float64)
+                    # on this node's own copy: other nodes showing the mesh keep theirs
+                    node.mesh = dataclasses.replace(node.mesh, target_weights=np.array(weights, np.float64))
                 if "skin" in data:
                     self._skinned.append((node, data["skin"], data["mesh"]))
         light = (data.get("extensions") or {}).get("KHR_lights_punctual")
         if isinstance(light, dict) and isinstance(light.get("light"), int):
             node.light = self._light(light["light"])
-        node.children = [self._node(c, built, path | {i}) for c in data.get("children", [])]
         return node
 
     def _light(self, i: int) -> Light | None:
@@ -689,9 +711,21 @@ class _Writer:
         self._arr("accessors").append(acc)
         return len(self.doc["accessors"]) - 1
 
-    def _node(self, node: Node, as_root: bool = False) -> int | None:
-        if id(node) in self.lifted and not as_root:
+    def _node(self, root: Node, as_root: bool = False) -> int | None:
+        if id(root) in self.lifted and not as_root:
             return None  # written as a root instead
+        top = self._one_node(root, as_root)
+        stack = [(c, top) for c in reversed(root.children)]  # a loop, not recursion: scenes can be very deep
+        while stack:
+            node, parent = stack.pop()
+            if id(node) in self.lifted:
+                continue
+            idx = self._one_node(node, False)
+            self.doc["nodes"][parent].setdefault("children", []).append(idx)
+            stack.extend((c, idx) for c in reversed(node.children))
+        return top
+
+    def _one_node(self, node: Node, as_root: bool) -> int:
         idx = len(self.doc["nodes"])
         out = {"name": node.name}
         self.doc["nodes"].append(out)
@@ -713,9 +747,6 @@ class _Writer:
                     self.pending.append((out, skin))
         if node.light is not None:
             out["extensions"] = {"KHR_lights_punctual": {"light": self._light(node.light)}}
-        kids = [k for k in (self._node(c) for c in node.children) if k is not None]
-        if kids:
-            out["children"] = kids
         return idx
 
     def _light(self, light: Light) -> int:
@@ -885,5 +916,5 @@ def _to_png(data: bytes) -> tuple[bytes | None, str | None]:
             out = io.BytesIO()
             im.save(out, "PNG")
             return out.getvalue(), "image/png"
-    except Exception:  # noqa: BLE001 - an unreadable texture shouldn't sink the whole model
+    except Exception:
         return None, None

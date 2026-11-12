@@ -34,15 +34,16 @@ from pathlib import Path
 
 import numpy as np
 
-from .fbx import _EXT, TextureFinder
 from .geometry import (
     decompose_many,
+    safe_inverse,
     scaling,
     transform_points,
     translation,
     unique_rows,
 )
 from .scene import (
+    _EXT,
     DAMAGED,
     Animation,
     Channel,
@@ -52,6 +53,8 @@ from .scene import (
     MeshportError,
     Node,
     Scene,
+    TextureFinder,
+    replaces_other_file,
 )
 
 MAIN, VERSION, EDIT, MESH_VERSION, MASTER_SCALE = 0x4D4D, 0x0002, 0x3D3D, 0x3D3E, 0x0100
@@ -160,7 +163,8 @@ class _Reader:
                     loose += nodes
         keys = [k for cid, s, e in _chunks(data, 6, end) if cid == KFDATA for k in self._keyframer(s, e)]
         # Saved on the first frame, the stored geometry already is the first-frame pose, exactly.
-        exact = self.saved_frame is not None and self.saved_frame in (self.segment_start, 160 * self.segment_start)
+        start = self.segment_start or 0  # a keyframer without its frame range (KF_SEGMENT) starts at 0
+        exact = self.saved_frame is not None and self.saved_frame in (start, 160 * start)
         scene = Scene(self._hierarchy(keys, objects, loose, exact) if keys else loose)
         if not scene.meshes:
             raise MeshportError("No 3D geometry found in this file")
@@ -316,29 +320,36 @@ class _Reader:
             node.children = parts
             placed.append((node, parent_id))
             by_id.setdefault(key["id"], node)
-        parent_of: dict[int, Node] = {}
+        top: dict[int, int] = {}  # each linked node's way up to the root of its tree (shortened as it's walked)
+
+        def root_of(n: int) -> int:
+            path = []
+            while top.get(n, n) != n:
+                path.append(n)
+                n = top[n]
+            for p in path:
+                top[p] = n
+            return n
+
         roots = []
         for node, parent_id in placed:
             parent = by_id.get(parent_id) if parent_id >= 0 else None
-            up = parent
-            while up is not None and up is not node:  # refuse links that would make a loop
-                up = parent_of.get(id(up))
-            if parent is None or up is node:
+            # refuse a link that would make a loop: one to a node already below this one (each node is
+            # placed once, so it's still the root of its own tree here)
+            if parent is None or root_of(id(parent)) == id(node):
                 roots.append(node)
             else:
                 parent.children.append(node)
-                parent_of[id(node)] = parent
+                top[id(node)] = root_of(id(parent))
         for node in roots:
             node.matrix = _Z_UP @ node.matrix
-
-        def settle(node: Node, parent_world: np.ndarray):
+        todo = [(node, np.eye(4)) for node in roots]  # a loop, not recursion: a chain can be thousands deep
+        while todo:
+            node, parent_world = todo.pop()
             if id(node) in keep and abs(np.linalg.det(parent_world)) > 1e-12:
-                node.matrix = np.linalg.inv(parent_world) @ keep[id(node)]
-            for child in node.children:
-                settle(child, parent_world @ node.matrix)
-
-        for node in roots:
-            settle(node, np.eye(4))
+                node.matrix = safe_inverse(parent_world) @ keep[id(node)]
+            world = parent_world @ node.matrix
+            todo += [(child, world) for child in node.children]
         roots = [n for n in roots if id(n) not in cameras or n.children]  # cameras only stay as parents
         for node, _ in Scene(roots).walk():
             node.children = [c for c in node.children if id(c) not in cameras or c.children]
@@ -376,7 +387,7 @@ class _Reader:
         # The points are stored in world space; the matrix is where the object's own axes are.
         if matrix is None or not np.all(np.isfinite(matrix)) or abs(np.linalg.det(matrix)) < 1e-12:
             matrix = np.eye(4)
-        positions = transform_points(np.linalg.inv(matrix), points)
+        positions = transform_points(safe_inverse(matrix), points)
         normals = None
         if smooth is not None:
             # Smoothed where the points are stored, as Autodesk's 3DS reader does (it matters
@@ -498,15 +509,9 @@ def _key_matrix(key: dict) -> np.ndarray:
     m = translation(key[POS_TRACK] or (0.0, 0.0, 0.0))
     if key[ROT_TRACK]:
         angle, *axis = key[ROT_TRACK]
-        axis = np.array(axis, np.float64)
-        length = np.linalg.norm(axis)
-        if length > 0:
-            x, y, z = axis / length
-            k = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
-            r = np.eye(4)
-            # 3DS turns the other way round its axis
-            r[:3, :3] = np.eye(3) - np.sin(angle) * k + (1 - np.cos(angle)) * k @ k
-            m = m @ r
+        r = np.eye(4)
+        r[:3, :3] = _turn(angle, axis)
+        m = m @ r
     return m @ scaling(key[SCL_TRACK] or (1.0, 1.0, 1.0))
 
 
@@ -655,6 +660,7 @@ def write_file(scene: Scene, path: str | os.PathLike) -> list[Path]:
     """Write path (.3ds) and the texture files it refers to next to it. Returns every file written."""
     path = Path(path)
     writer = _Writer(scene.deformed())
+    writer.folder = path.parent
     data = writer.build()
     written = [path]
     for image, name in writer.image_files():
@@ -714,6 +720,7 @@ class _Writer:
         self.materials: list[bytes] = []
         self.images: dict[int, tuple[Image, str]] = {}
         self.object_taken: set[str] = set()
+        self.folder: Path | None = None  # where write_file puts the textures, so none replaces another file
 
     def image_files(self) -> list[tuple[Image, str]]:
         return [(img, name) for img, name in self.images.values() if img.data]
@@ -731,7 +738,7 @@ class _Writer:
 
     def _objects(self, node: Node, world: np.ndarray) -> list[bytes]:
         mesh = node.mesh
-        matrix = np.linalg.inv(_Z_UP) @ world  # into 3DS space, where the points are stored
+        matrix = safe_inverse(_Z_UP) @ world  # into 3DS space, where the points are stored
         tris = mesh.triangles()
         if not len(tris):
             return []
@@ -817,8 +824,12 @@ class _Writer:
             ext = _EXT.get(image.mime or "") or path.suffix.lstrip(".").lower() or "png"
             ext = "".join(c for c in ext if c.isascii() and c.isalnum())[:3] or "png"
             stem = "".join(c if c.isalnum() or c in "-_" else "_" for c in (path.stem or image.name or "texture"))
-            taken = {name.lower() for _, name in self.images.values()}
-            name = _short_name(stem or "texture", 8, {n.rsplit(".", 1)[0] for n in taken})
+            taken = {n.lower().rsplit(".", 1)[0] for _, n in self.images.values()}
+            while True:
+                name = _short_name(stem or "texture", 8, taken)
+                if not image.data or not replaces_other_file(self.folder, f"{name}.{ext}", image.data):
+                    break
+                taken.add(name.lower())
             self.images[id(image)] = (image, f"{name}.{ext}")
         return self.images[id(image)][1]
 

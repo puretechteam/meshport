@@ -186,8 +186,28 @@ def transform_points(m: np.ndarray, p: np.ndarray) -> np.ndarray:
     return p @ m[:3, :3].T + m[:3, 3]
 
 
+def safe_inverse(m: np.ndarray) -> np.ndarray:
+    """A transform's inverse (4x4 or 3x3, or a stack of them). An object scaled to 0 (a common way to hide things
+    in Blender) has none: then its pseudo-inverse, so what the scale took away stays away, and
+    parent @ safe_inverse(parent) @ child is still the child."""
+    m = np.asarray(m, np.float64)
+    try:
+        out = np.linalg.inv(m)
+        if np.isfinite(out).all():
+            return out
+    except np.linalg.LinAlgError:
+        pass
+    if m.shape[-1] == 3:
+        return np.linalg.pinv(m)
+    out = np.broadcast_to(np.eye(4), m.shape).copy()
+    a = np.linalg.pinv(m[..., :3, :3])
+    out[..., :3, :3] = a
+    out[..., :3, 3] = -(a @ m[..., :3, 3, None])[..., 0]
+    return out
+
+
 def transform_normals(m: np.ndarray, n: np.ndarray) -> np.ndarray:
-    inv_t = np.linalg.inv(m[:3, :3]).T
+    inv_t = safe_inverse(m[:3, :3]).T
     out = n @ inv_t.T
     length = np.linalg.norm(out, axis=1, keepdims=True)
     return np.divide(out, length, out=np.zeros_like(out), where=length > 0)

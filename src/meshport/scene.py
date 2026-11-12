@@ -17,6 +17,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .geometry import safe_inverse
+
 
 class MeshportError(Exception):
     """A file meshport can't read or write. The message is meant for end users."""
@@ -65,6 +67,20 @@ def frame_grid(first: float, last: float) -> np.ndarray | None:
 
 def too_many_frames(count: float) -> MeshportError:
     return MeshportError(f"This animation is too long: {count:,.0f} frames, over meshport's limit of {MAX_FRAMES:,}")
+
+
+def replaces_other_file(folder: Path | None, name: str, data: bytes) -> bool:
+    """Whether writing data as folder/name would replace a different file already there. Writers pick
+    another name for a texture then, so saving a model never overwrites someone's own picture."""
+    if folder is None:
+        return False
+    target = folder / name
+    try:
+        if not target.exists():
+            return False
+        return not target.is_file() or target.stat().st_size != len(data) or target.read_bytes() != data
+    except OSError:
+        return True
 
 
 def linked_path(name: str, folder: Path, root: Path | None = None) -> Path | None:
@@ -359,16 +375,27 @@ class Animation:
     def end(self) -> float:
         return max((float(c.times[-1]) for c in self.channels), default=0.0)
 
-    def local_matrix(self, node: Node, t: float) -> np.ndarray:
-        """node's local matrix at time t: its animated parts sampled, the rest as it stands."""
+    def local_matrix(self, node: Node, t: float, mine: list[Channel] | None = None) -> np.ndarray:
+        """node's local matrix at time t: its animated parts sampled, the rest as it stands. mine:
+        node's transform channels, when the caller has them already (see by_node)."""
         from .geometry import compose_trs, decompose_trs
-        mine = [c for c in self.channels if c.node is node and c.path in PATHS]
+        if mine is None:
+            mine = [c for c in self.channels if c.node is node and c.path in PATHS]
         if not mine:
             return node.matrix
         trs = dict(zip(("translation", "rotation", "scale"), decompose_trs(node.matrix)))
         for c in mine:
             trs[c.path] = c.sample(t)
         return compose_trs(trs["translation"], trs["rotation"], trs["scale"])
+
+    def by_node(self) -> dict[int, list[Channel]]:
+        """Each animated node's transform channels, in order, by id(node): for posing every node,
+        which would otherwise look through all the channels once per node."""
+        out: dict[int, list[Channel]] = {}
+        for c in self.channels:
+            if c.path in PATHS:
+                out.setdefault(id(c.node), []).append(c)
+        return out
 
     def weights(self, node: Node, t: float) -> np.ndarray | None:
         """The blend shape weights of node's mesh at time t, or None when this doesn't animate them."""
@@ -379,6 +406,11 @@ class Animation:
         """The same motion as LINEAR keys every 1/rate seconds from start to end, for formats
         that can't hold the original curves."""
         start, end = self.start, self.end
+        if not (np.isfinite(rate) and rate > 0 and np.isfinite(start) and np.isfinite(end)):
+            raise MeshportError("Can't bake an animation at that rate")
+        count = (end - start) * rate
+        if count + 1 > MAX_FRAMES:
+            raise too_many_frames(count + 1)
         times = np.arange(start, end, 1.0 / rate) if end > start else np.array([start])
         if times[-1] < end:
             times = np.append(times, end)
@@ -400,10 +432,40 @@ class Scene:
         together (Blender exports each object's action as its own). Without one, the first
         animation poses the scene; without any, this is the same as walk()."""
         animation = self._playing(animation)
+        channels = animation.by_node() if animation is not None else {}
         todo = [(r, None) for r in reversed(self.roots)]
         while todo:
             node, parent = todo.pop()
-            local = animation.local_matrix(node, t) if animation is not None else node.matrix
+            local = animation.local_matrix(node, t, channels.get(id(node), [])) if animation is not None else node.matrix
+            world = local if parent is None else parent @ local
+            yield node, world
+            todo.extend((c, world) for c in reversed(node.children))
+
+    def walk_over(self, times, animation: Animation | list[Animation] | None = None):
+        """walk_at for many times at once: yield (node, (len(times), 4, 4) world matrices), each channel
+        sampled once for all the times. Writers that pose a rig frame by frame use it (a 60-bone rig over
+        400 frames went from 24,000 single samples to 60). Give it the times a few hundred at a time:
+        it holds a world matrix per time for each node still to be walked."""
+        from .geometry import decompose_trs, rotations
+        animation = self._playing(animation)
+        times = np.atleast_1d(np.asarray(times, np.float64))
+        n = len(times)
+        channels = animation.by_node() if animation is not None else {}
+        todo = [(r, None) for r in reversed(self.roots)]
+        while todo:
+            node, parent = todo.pop()
+            mine = channels.get(id(node))
+            if mine:
+                trs = {k: np.tile(v, (n, 1)) for k, v in zip(("translation", "rotation", "scale"),
+                                                               decompose_trs(node.matrix))}
+                for c in mine:  # a later channel for the same property wins, as in local_matrix
+                    trs[c.path] = np.asarray(c.sample(times), np.float64).reshape(n, -1)
+                local = np.zeros((n, 4, 4))
+                local[:, :3, :3] = rotations(trs["rotation"]) * trs["scale"][:, None, :]
+                local[:, :3, 3] = trs["translation"]
+                local[:, 3, 3] = 1.0
+            else:
+                local = np.broadcast_to(np.asarray(node.matrix, np.float64), (n, 4, 4))
             world = local if parent is None else parent @ local
             yield node, world
             todo.extend((c, world) for c in reversed(node.children))
@@ -441,7 +503,7 @@ class Scene:
         from dataclasses import replace
         copies: dict[int, Node] = {}
         for node, _ in self.walk():
-            copies[id(node)] = Node(node.name, node.matrix, node.mesh, node.materials)
+            copies[id(node)] = Node(node.name, node.matrix, node.mesh, node.materials, light=node.light)
         for node, _ in self.walk():
             copies[id(node)].children = [copies[id(c)] for c in node.children]
         roots = [copies[id(r)] for r in self.roots]
@@ -450,7 +512,7 @@ class Scene:
             if node.mesh is not None and (node.skin is not None or node.mesh.targets):
                 points = posed[node] if node.skin is not None else node.mesh.morphed()
                 if node.skin is not None:  # back into the node's space
-                    inverse = np.linalg.inv(world)
+                    inverse = safe_inverse(world)
                     points = points @ inverse[:3, :3].T + inverse[:3, 3]
                 copies[id(node)].mesh = replace(node.mesh, positions=points, targets=[], target_weights=None)
         animations = [Animation(a.name, [replace(c, node=copies[id(c.node)]) for c in a.channels
@@ -532,3 +594,82 @@ def sniff_mime(data: bytes) -> str | None:
     if data.startswith(b"GIF8"):
         return "image/gif"
     return None
+
+
+# Extensions for the image types writers save textures as
+_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/tiff": "tif",
+        "image/bmp": "bmp", "image/vnd-ms.dds": "dds", "image/vnd.adobe.photoshop": "psd", "image/gif": "gif"}
+
+
+_TEXTURE_DIRS = frozenset({"texture", "textures", "tex", "materials", "images", "maps"})
+
+
+class TextureFinder:
+    """Finds the texture files a model points at. Shared by the FBX, 3DS, OBJ and .blend readers."""
+
+    def __init__(self, base_dir: Path | None):
+        self.base_dir = base_dir.resolve() if base_dir is not None else None
+        self.root = self.base_dir.parent if self.base_dir is not None else None
+        self._files: dict[str, Path] | None = None
+
+    def find(self, names: list[str]) -> bytes | None:
+        """Texture paths in model files usually point at the artist's own drive. Files are only
+        read from the model's folder and the folder above it (and below them): a path is tried
+        as written when it's relative and stays in there, then its file name next to the model,
+        in texture folders there or one level up (Pack/Models/x.fbx -> Pack/Textures/), and
+        anywhere under the folder above the model. Absolute, network and URL paths are never
+        opened, and only image files are taken, so a model can't pull other files into the
+        output. Without a folder (bytes read on their own), nothing is looked up."""
+        if self.base_dir is None:
+            return None
+        bases = []
+        for n in names:
+            bases.append(n.replace("\\", "/").rsplit("/", 1)[-1].lower())
+            path = linked_path(n, self.base_dir, self.root)
+            data = read_image_file(path) if path is not None else None
+            if data is not None:
+                return data
+        listing = self._listing()
+        for base in bases:
+            if base in listing:
+                path = linked_path(listing[base].name, listing[base].parent, self.root)  # a link can't lead out
+                data = read_image_file(path) if path is not None else None
+                if data is not None:
+                    return data
+        return None
+
+    def _listing(self) -> dict[str, Path]:
+        """Lower-case file name -> path, nearest folders first, capped so a model in a huge
+        folder doesn't stall the read."""
+        if self._files is not None:
+            return self._files
+        files: dict[str, Path] = {}
+
+        def add(folder: Path):
+            try:
+                for f in folder.iterdir():
+                    if f.is_file():
+                        files.setdefault(f.name.lower(), f)
+            except OSError:
+                pass
+
+        add(self.base_dir)
+        for fbm in self.base_dir.glob("*.fbm"):
+            add(fbm)
+        for up in (self.base_dir, self.base_dir.parent):
+            try:
+                subdirs = [d for d in up.iterdir() if d.is_dir() and d.name.lower() in _TEXTURE_DIRS]
+            except OSError:
+                subdirs = []
+            for d in subdirs:
+                add(d)
+        budget = 20000
+        for dirpath, dirnames, filenames in os.walk(self.base_dir.parent):
+            dirnames.sort()
+            for f in filenames:
+                files.setdefault(f.lower(), Path(dirpath) / f)
+            budget -= len(filenames) + 1
+            if budget <= 0:
+                break
+        self._files = files
+        return files

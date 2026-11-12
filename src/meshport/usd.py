@@ -60,6 +60,7 @@ from .geometry import (
     decompose_many,
     decompose_trs,
     euler,
+    safe_inverse,
     scaling,
     slerp,
     translation,
@@ -86,6 +87,7 @@ from .scene import (
     looks_like_image,
     node_budget,
     read_image_file,
+    replaces_other_file,
     too_many_frames,
     with_crossings,
 )
@@ -152,8 +154,10 @@ class _Source:
         return str(self._disk(asset)) if self._disk(asset) else asset
 
     def _inner(self, asset: str) -> str:
-        p = PurePosixPath(self.inner_dir) / asset.replace("\\", "/").lstrip("./") if not asset.startswith("/") \
-            else PurePosixPath(asset.lstrip("/"))
+        asset = asset.replace("\\", "/")
+        while asset.startswith("./"):  # only "./": a "../" climbs out of this layer's folder below
+            asset = asset[2:]
+        p = PurePosixPath(self.inner_dir) / asset if not asset.startswith("/") else PurePosixPath(asset.lstrip("/"))
         parts = []
         for part in p.parts:
             if part == "..":
@@ -166,11 +170,12 @@ class _Source:
     def _disk(self, asset: str) -> Path | None:
         return linked_path(asset, self.base_dir, self.root) if self.base_dir is not None else None
 
-    def read(self, asset: str, max_size: int = 1 << 31) -> tuple[bytes, _Source] | None:
-        """A file next to (or inside the same package as) this layer: (bytes, its own source)."""
+    def read(self, asset: str, max_size: int = 1 << 31, whole: bool = False) -> tuple[bytes, _Source] | None:
+        """A file next to (or inside the same package as) this layer: (bytes, its own source). A .usdz on
+        disk comes back as its root layer, or with whole, as the package itself."""
         if "[" in asset and asset.endswith("]"):  # package[inner path]
             outer, inner = asset[:-1].split("[", 1)
-            got = self.read(outer)
+            got = self.read(outer, whole=True)
             if got is None or detect(got[0]) != "usdz":
                 return None
             pkg = _Package(got[0])
@@ -193,7 +198,7 @@ class _Source:
             data = path.read_bytes()
         except OSError:
             return None
-        if detect(data) == "usdz":
+        if detect(data) == "usdz" and not whole:
             pkg = _Package(data)
             root = pkg.root()
             return pkg.read(root), _Source(None, pkg, str(PurePosixPath(root).parent))
@@ -686,7 +691,7 @@ class _Builder:
             return None
         local, reset = self._xform(path)
         if reset:  # ignores the parents' transforms
-            local = np.linalg.inv(parent_world) @ local
+            local = safe_inverse(parent_world) @ local
         self.nodes.spend()
         node = Node(element_name(path), local)
         if self._animated_ops(path):
@@ -803,7 +808,7 @@ class _Builder:
             mat = _op_matrix(kind, v)
             if mat is None:
                 continue
-            m = m @ (np.linalg.inv(mat) if invert else mat)
+            m = m @ (safe_inverse(mat) if invert else mat)
         return m, reset
 
     def _animated_ops(self, path: str) -> dict:
@@ -841,7 +846,7 @@ class _Builder:
                 mats = None if values is None else [_op_matrix(kind, v) for v in values]
                 mats = None if mats is None or any(x is None for x in mats) else np.array(mats)
             if mats is not None:
-                m = m @ (np.linalg.inv(mats) if invert else mats)
+                m = m @ (safe_inverse(mats) if invert else mats)
         return m
 
     def _channels(self, node: Node, path: str, reset_parent, convert, tcps: float) -> list[Channel]:
@@ -860,7 +865,7 @@ class _Builder:
             times = np.unique(np.concatenate([keys, grid]))
         m = self._xform_at(path, times)
         if reset_parent is not None:
-            m = np.linalg.inv(reset_parent) @ m
+            m = safe_inverse(reset_parent) @ m
         if convert is not None:
             m = convert @ m
         out = []
@@ -890,7 +895,7 @@ class _Builder:
             if rest is not None:
                 local = rest[k]
             elif binds is not None:
-                local = binds[k] if parent is None else np.linalg.inv(binds[parent]) @ binds[k]
+                local = binds[k] if parent is None else safe_inverse(binds[parent]) @ binds[k]
             else:
                 local = np.eye(4)
             node = Node(token.rsplit("/", 1)[-1], local)
@@ -987,7 +992,7 @@ class _Builder:
         total = w.sum(1, keepdims=True)
         w = np.divide(w, total, out=np.zeros_like(w), where=total > 0)
         w[total[:, 0] <= 0, 0] = 1.0
-        skin = Skin([joints[j] for j in used], np.array([np.linalg.inv(binds[j]) @ geom for j in used]), idx, w,
+        skin = Skin([joints[j] for j in used], np.array([safe_inverse(binds[j]) @ geom for j in used]), idx, w,
                     element_name(skel))
         skin.validate(mesh)
         return skin, weights
@@ -1540,6 +1545,7 @@ class _LayerWriter:
         self.layer = Layer()
         self.textures: dict[int, str] = {}
         self.files: dict[str, bytes] = {}
+        self.folder: Path | None = None  # where write_file puts textures/, so none replaces another file
         self.materials: dict[int, str] = {}
         self.mat_names: set[str] = set()
         self.looks: str | None = None  # the Scope holding the materials, made when first needed
@@ -1789,8 +1795,11 @@ class _LayerWriter:
             tokens[k] = name if above[k] < 0 else f"{tokens[above[k]]}/{name}"
 
         def relative(worlds: dict) -> np.ndarray:
-            return np.array([np.linalg.inv(worlds[id(joints[above[k]])]) @ worlds[id(joints[k])] if above[k] >= 0
-                             else worlds[id(joints[k])] for k in order])
+            """Each joint's matrix in its parent's space, in order: (J, 4, 4), or (F, J, 4, 4) for
+            worlds of F frames each."""
+            out = np.array([safe_inverse(worlds[id(joints[above[k]])]) @ worlds[id(joints[k])] if above[k] >= 0
+                            else worlds[id(joints[k])] for k in order])
+            return out.transpose(1, 0, 2, 3) if out.ndim == 4 else out
         anim = child_path(path, "Animation")
         if joints:
             self.attr(path, "joints", "token[]", [tokens[k] for k in order], uniform=True)
@@ -1815,8 +1824,11 @@ class _LayerWriter:
             if moves:
                 keys = np.unique(np.concatenate([c.times for cs in self.moving.values() for c in cs]))
                 times = self._times(keys, True)
-                worlds = [{id(n): w for n, w in self.scene.walk_at(t, self.animation)} for t in times]
-                parts = decompose_many(np.array([relative(w) for w in worlds]).reshape(-1, 4, 4))
+                posed = []
+                for a in range(0, len(times), 256):  # every channel sampled once per few hundred frames
+                    worlds = {id(n): w for n, w in self.scene.walk_over(times[a:a + 256], self.animation)}
+                    posed.append(relative(worlds))
+                parts = decompose_many(np.concatenate(posed).reshape(-1, 4, 4))
                 t, q, s = (v.reshape(len(times), len(joints), -1) for v in parts)
                 codes = [float(x * self.fps) for x in times]
                 self.attr_samples(anim, "translations", "float3[]",
@@ -2008,7 +2020,7 @@ class _LayerWriter:
                 return None
             stem = re.sub(r"[^A-Za-z0-9_.-]", "_", image.name or "texture")[:60] or "texture"
             name, i = f"textures/{stem}.{ext}", 1
-            while name in self.files:
+            while name in self.files or replaces_other_file(self.folder, name, data):
                 name = f"textures/{stem}_{i}.{ext}"
                 i += 1
             self.files[name] = data
@@ -2046,6 +2058,7 @@ def write_file(scene: Scene, path: str | os.PathLike, fmt: str) -> list[Path]:
         path.write_bytes(write(scene, "usdz"))
         return [path]
     writer = _LayerWriter(scene)
+    writer.folder = path.parent
     layer = writer.build()
     path.write_bytes(usda.write(layer) if fmt == "usda" else usdcrate.write(layer))
     written = [path]

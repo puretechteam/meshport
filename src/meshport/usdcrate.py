@@ -83,7 +83,7 @@ def lz4_block_decompress(src: bytes, max_size: int) -> bytes:
         return lz4.block.decompress(src, uncompressed_size=max_size)
     except ImportError:
         pass
-    except Exception as e:  # noqa: BLE001 - lz4 raises its own error type
+    except Exception as e:
         raise MeshportError(f"This USD file is damaged (bad compressed data: {e})") from None
     out = bytearray()
     i, n = 0, len(src)
@@ -419,9 +419,6 @@ class _Reader:
                 i += 1
             layer.specs[path] = Spec(kind, fields)
         return layer
-
-    def token(self, i: int) -> str:
-        return self.tokens[i]
 
     def string(self, i: int) -> str:
         return self.tokens[int(self.strings[i])]

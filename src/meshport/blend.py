@@ -44,7 +44,7 @@ from pathlib import Path
 import numpy as np
 
 from . import blendanim, blendcurve, blendmods, blendskin
-from .geometry import decompose_many, euler, scaling, translation
+from .geometry import decompose_many, euler, safe_inverse, scaling, translation
 from .scene import (
     DAMAGED,
     MAX_FRAMES,
@@ -60,6 +60,7 @@ from .scene import (
     Node,
     Scene,
     Skin,
+    TextureFinder,
     node_budget,
     pack_influences,
 )
@@ -97,7 +98,7 @@ def _decompress(data: bytes, limit: int | None = None) -> bytes:
         return _inflate(data, limit, head)
     except MeshportError:
         raise
-    except Exception as e:  # noqa: BLE001 - each decompressor has its own error types
+    except Exception as e:
         raise MeshportError(f"This .blend file is damaged (its compressed data is broken: {e})") from None
 
 
@@ -165,10 +166,10 @@ def _inflate(data: bytes, limit: int, head: bool) -> bytes:
 # ============================================================================ blocks and SDNA
 
 class _Block:
-    __slots__ = ("code", "count", "index", "length", "offset", "old", "owner", "sdna")
+    __slots__ = ("code", "index", "length", "offset", "old", "owner", "sdna")
 
-    def __init__(self, code, sdna, old, length, count, offset, owner, index):
-        self.code, self.sdna, self.old, self.length, self.count, self.offset = code, sdna, old, length, count, offset
+    def __init__(self, code, sdna, old, length, offset, owner, index):
+        self.code, self.sdna, self.old, self.length, self.offset = code, sdna, old, length, offset
         self.owner, self.index = owner, index  # owner: the datablock (ID) block this one belongs to
 
     @property
@@ -204,16 +205,16 @@ class _File:
         pos, owner = head, -1
         while pos + size <= len(data):
             if large:
-                code, sdna, old, length, count = struct.unpack_from(fmt, data, pos)
+                code, sdna, old, length, _count = struct.unpack_from(fmt, data, pos)
             else:
-                code, length, old, sdna, count = struct.unpack_from(fmt, data, pos)
+                code, length, old, sdna, _count = struct.unpack_from(fmt, data, pos)
             if code == b"ENDB":
                 break
             if length < 0 or pos + size + length > len(data):
                 raise MeshportError("This .blend file is damaged or cut short")
             if code != b"DATA":
                 owner = len(self.blocks)
-            self.blocks.append(_Block(code, sdna, old, length, count, pos + size, owner, len(self.blocks)))
+            self.blocks.append(_Block(code, sdna, old, length, pos + size, owner, len(self.blocks)))
             pos += size + length
         dna = next((b for b in self.blocks if b.code == b"DNA1"), None)
         if dna is None:
@@ -264,6 +265,7 @@ class _File:
         self.structs: list[tuple[str, dict]] = []
         self.struct_index: dict[str, int] = {}
         self.struct_size: dict[str, int] = {}
+        parsed: dict[int, tuple] = {}  # each field name taken apart once: thousands of fields share them
         for _ in range(n):
             t, nf = struct.unpack_from("<hh", d, pos)
             pos += 4
@@ -271,13 +273,15 @@ class _File:
             pos += nf * 4
             fields, off = {}, 0
             for ft, fn in pairs.tolist():
-                raw = names[fn]
-                is_ptr = raw.startswith(("*", "(*"))
-                dims = [int(x) for x in re.findall(r"\[(\d+)\]", raw)]
-                clean = re.sub(r"\[.*", "", raw).strip("*()")
-                count = math.prod(dims) if dims else 1
+                got = parsed.get(fn)
+                if got is None:
+                    raw = names[fn]
+                    dims = [int(x) for x in re.findall(r"\[(\d+)\]", raw)]
+                    got = parsed[fn] = (re.sub(r"\[.*", "", raw).strip("*()"), raw.startswith(("*", "(*")), dims,
+                                        math.prod(dims) if dims else 1, raw.startswith("**"))
+                clean, is_ptr, dims, count, ptr_ptr = got
                 elem = self.ptr if is_ptr else tlen[ft]
-                fields[clean] = (off, types[ft], is_ptr, dims, raw.startswith("**"))
+                fields[clean] = (off, types[ft], is_ptr, dims, ptr_ptr)
                 off += elem * count
             self.struct_index[types[t]] = len(self.structs)
             self.structs.append((types[t], fields))
@@ -415,6 +419,8 @@ class _Reader:
         self.raw: dict[int, tuple[Mesh, np.ndarray] | None] = {}
         self.capping: set[int] = set()  # objects whose mesh is being made for an Array's cap
         self.meshes: dict[int, Mesh | None] = {}
+        self.modified: dict[int, tuple[Mesh | None]] = {}  # an object's mesh with its modifiers applied
+        self.finder = None  # a TextureFinder, made when the first missing texture is looked for
         self.worlds: dict[int, np.ndarray] = {}
         self.materials: dict[int, Material] = {}
         self.images: dict[int, Image | None] = {}
@@ -458,7 +464,7 @@ class _Reader:
             parent = ob.get("parent", 0)
             node = nodes[address]
             if parent in nodes:
-                node.matrix = np.linalg.inv(worlds[parent]) @ worlds[address]
+                node.matrix = safe_inverse(worlds[parent]) @ worlds[address]
                 nodes[parent].children.append(node)
             else:
                 node.matrix = worlds[address]
@@ -611,8 +617,8 @@ class _Reader:
         rows, joints, weights = rows[keep], joints[keep], weights[keep]
         total = np.bincount(rows, weights, count)
         weights = weights / total[rows]  # the modifier normalizes each vertex's weights
-        to_mesh = np.linalg.inv(self.worlds[md.get("object", 0)]) @ self.worlds[address]
-        binds = [np.linalg.inv(rig.rest[b]) @ to_mesh for b in bones]
+        to_mesh = safe_inverse(self.worlds[md.get("object", 0)]) @ self.worlds[address]
+        binds = [safe_inverse(rig.rest[b]) @ to_mesh for b in bones]
         nodes = [rig.nodes[b] for b in bones]
         free = np.flatnonzero(total <= 0)
         if len(free):  # vertices no bone moves stay with the mesh object
@@ -667,12 +673,18 @@ class _Reader:
             return None
         slots = self._slots(ob, me)
         modifiers = blendmods.stack(ob) if self.modifiers else []
-        if modifiers:  # this object's own copy
+        if modifiers:  # this object's own copy, made once however many collection instances show it
+            cached = self.modified.get(ob_address)
+            if cached is not None:
+                return cached[0], slots
             ctx = blendmods.Context(self._world(ob_address, ob, self.worlds), self._world_of, len(slots),
                                     self.generated, lambda a: self._cap_mesh(a, ob_address))
             mesh, smooth = blendmods.apply(*raw, modifiers, ctx)
             self.generated.spend(len(mesh.corners))
-            return (_finish(mesh, smooth) if len(mesh.face_sizes) else None), slots
+            split = getattr(raw[0], "split_angle", None)
+            done = _finish(mesh, smooth, split) if len(mesh.face_sizes) else None
+            self.modified[ob_address] = (done,)
+            return done, slots
         if key not in self.meshes:
             self.meshes[key] = _finish(*raw)
         return self.meshes[key], slots
@@ -689,7 +701,7 @@ class _Reader:
         base = next((a for a, o in members if o.id_name() == fam), min(members, key=lambda m: m[1].id_name())[0])
         if base != ob_address:
             return None
-        inverse = np.linalg.inv(self._world(ob_address, ob, self.worlds))
+        inverse = safe_inverse(self._world(ob_address, ob, self.worlds))
         elements = []
         for address, member in members:
             data = self._id(member.get("data", 0), "MetaBall")
@@ -871,9 +883,10 @@ class _Reader:
         return image
 
     def _image_file(self, path: str) -> bytes | None:
-        from .fbx import TextureFinder
         rel = path.removeprefix("//")  # "//" means "next to the .blend"
-        return TextureFinder(self.base_dir).find([rel])
+        if self.finder is None:  # one for the file: it lists the folders it searches once
+            self.finder = TextureFinder(self.base_dir)
+        return self.finder.find([rel])
 
 
 def _keep(node: Node, bones: set[int] = frozenset()) -> bool:
@@ -1131,11 +1144,15 @@ def _read_mesh(me: _S) -> tuple[Mesh, np.ndarray] | None:
         crease = np.zeros(len(pairs)) if crease is None else np.asarray(crease, np.float64).ravel()
         if len(crease) == len(pairs) and (vert_crease is None or len(vert_crease) == nv):
             mesh.creases = blendmods.Creases.from_blender(pairs, crease, vert_crease)
+    mesh.sharp, mesh.split_angle = _sharp_edges(me, attrs)
     return mesh, smooth
 
 
-def _finish(mesh: Mesh, smooth: np.ndarray) -> Mesh:
-    mesh.normals = _normals(mesh, smooth)
+def _finish(mesh: Mesh, smooth: np.ndarray, split: float | None = None) -> Mesh:
+    """The mesh with Blender's normals. Sharp edges are known while the mesh keeps its points' numbers
+    (a modifier that rebuilds the mesh drops them); the old auto smooth angle applies either way."""
+    sharp = getattr(mesh, "sharp", None)
+    mesh.normals = _normals(mesh, smooth, sharp, getattr(mesh, "split_angle", split))
     return mesh
 
 
@@ -1211,6 +1228,52 @@ def _attributes(me: _S, nv: int, nf: int, nc: int) -> dict:
     return out
 
 
+def _struct_array(me: _S, field: str, struct_name: str, count: int, member: str, dtype: str, comps: int = 1):
+    """One member of each struct in an array of them (the old MPoly, MLoop, MVert and MEdge arrays)."""
+    f = me.f
+    size = f.struct_size[struct_name]
+    spec = f.structs[f.struct_index[struct_name]][1][member]
+    raw = me.raw(field, "u1", size * count)
+    if raw is None:
+        return None
+    shape = (count, comps) if comps > 1 else (count,)
+    strides = (size, np.dtype(dtype).itemsize) if comps > 1 else (size,)
+    return np.ndarray(shape, dtype, raw.tobytes(), spec[0], strides).copy()
+
+
+_ME_AUTOSMOOTH, _ME_SHARP = 1 << 5, 1 << 9  # Mesh.flag (to 4.0) and MEdge.flag (to 3.4)
+
+
+def _sharp_edges(me: _S, attrs: dict) -> tuple[np.ndarray, float | None]:
+    """The edges marked sharp (as blendmods edge keys) and the old auto smooth angle, if it's on.
+    Blender 4.1 on always splits shading at sharp edges; before, only with Auto Smooth, which also
+    made sharp every edge whose faces turn more than its angle (Blender turns that into a Smooth by
+    Angle modifier when it opens such a file)."""
+    nothing = np.zeros(0, np.int64)
+    split = None
+    if me.f.version < 401:
+        if not int(me.get("flag", 0) or 0) & _ME_AUTOSMOOTH:
+            return nothing, None
+        split = float(me.get("smoothresh", math.radians(30.0)))
+    pairs, sharp = attrs.get((".edge_verts", _EDGE)), attrs.get(("sharp_edge", _EDGE))
+    ne = int(me.get("totedge", 0) or 0)
+    if pairs is None and ne and "MEdge" in me.f.struct_index and me.get("medge", 0):  # Blender 2.8 to 3.4
+        names = me.f.structs[me.f.struct_index["MEdge"]][1]
+        if all(k in names for k in ("v1", "v2", "flag")):
+            v1, v2 = (_struct_array(me, "medge", "MEdge", ne, k, "<i4") for k in ("v1", "v2"))
+            flag = _struct_array(me, "medge", "MEdge", ne, "flag", "<i2")
+            if v1 is not None and v2 is not None and flag is not None:
+                pairs = np.stack([v1, v2], 1)
+                if sharp is None:
+                    sharp = (flag.astype(np.int64) & _ME_SHARP) != 0
+    if pairs is None or sharp is None:
+        return nothing, split
+    pairs, sharp = np.asarray(pairs, np.int64).reshape(-1, 2), np.asarray(sharp).ravel().astype(bool)
+    if len(pairs) != len(sharp):
+        return nothing, split
+    return blendmods._edge_keys(pairs[sharp]), split
+
+
 def _legacy(me: _S, nv: int, nf: int, nc: int, material: np.ndarray | None = None):
     """Blender 2.8 to 3.5: MPoly, MLoop and MVert arrays (positions come back None without
     MVert). material is a "material_index" layer, used instead of mat_nr when the file has one."""
@@ -1219,14 +1282,7 @@ def _legacy(me: _S, nv: int, nf: int, nc: int, material: np.ndarray | None = Non
         return None
 
     def array(field: str, struct_name: str, count: int, member: str, dtype: str, comps: int = 1):
-        size = f.struct_size[struct_name]
-        spec = f.structs[f.struct_index[struct_name]][1][member]
-        raw = me.raw(field, "u1", size * count)
-        if raw is None:
-            return None
-        shape = (count, comps) if comps > 1 else (count,)
-        strides = (size, np.dtype(dtype).itemsize) if comps > 1 else (size,)
-        return np.ndarray(shape, dtype, raw.tobytes(), spec[0], strides).copy()
+        return _struct_array(me, field, struct_name, count, member, dtype, comps)
 
     has_mvert = "MVert" in f.struct_index and me.get("mvert", 0)
     positions = array("mvert", "MVert", nv, "co", "<f4", 3) if has_mvert else None
@@ -1246,28 +1302,40 @@ def _legacy(me: _S, nv: int, nf: int, nc: int, material: np.ndarray | None = Non
     return positions, offsets, corner_vert, mat_nr, smooth
 
 
-def _normals(mesh: Mesh, smooth: np.ndarray) -> np.ndarray:
-    """Per-corner normals as Blender shades: flat faces get their own normal, smooth faces the
-    average of the smooth faces around each vertex."""
-    sizes = mesh.face_sizes
-    starts = np.concatenate(([0], np.cumsum(sizes)[:-1]))
-    face = np.repeat(np.arange(len(sizes)), sizes)
-    c = np.arange(len(mesh.corners))
-    nxt = c + 1
-    nxt[starts + sizes - 1] = starts
-    p, pn = mesh.positions[mesh.corners], mesh.positions[mesh.corners[nxt]]
-    cross = np.cross(p, pn)
-    fn = np.zeros((len(sizes), 3))
-    for k in range(3):
-        fn[:, k] = np.bincount(face, cross[:, k], len(sizes))
+def _normals(mesh: Mesh, smooth: np.ndarray, sharp: np.ndarray | None = None,
+             split: float | None = None) -> np.ndarray:
+    """Per-corner normals as Blender (4.1 on) shades. Flat faces get their own normal. With every face
+    smooth and no sharp edge, each vertex gets the normal of all its faces, weighted by the angle of
+    each face's corner there. Otherwise the corners at a vertex make fans, split wherever shading
+    stops: a sharp edge, an edge of a flat face, an edge with other than two faces, or two faces wound
+    opposite ways (and with the old auto smooth on, an edge whose faces turn more than its angle);
+    each fan gets the angle-weighted normal of its faces."""
+    from .obj import _fans
+    face, nxt, prv = blendmods._topology(mesh.face_sizes)
+    fn = blendmods._face_normals(mesh.positions, mesh.face_sizes, mesh.corners, face, nxt)
     smooth = np.asarray(smooth, bool)
-    if len(smooth) != len(sizes):
-        smooth = np.ones(len(sizes), bool)
-    vn = np.zeros((len(mesh.positions), 3))
-    sm = smooth[face]
-    for k in range(3):
-        vn[:, k] = np.bincount(mesh.corners[sm], fn[face[sm], k], len(mesh.positions))
-    out = np.where(sm[:, None], vn[mesh.corners], fn[face])
+    if len(smooth) != len(mesh.face_sizes):
+        smooth = np.ones(len(mesh.face_sizes), bool)
+    if not smooth.any():
+        return fn[face]
+    angle = blendmods._corner_angles(mesh.positions, mesh.corners, nxt, prv)
+    sharp = np.zeros(0, np.int64) if sharp is None else sharp
+    if smooth.all() and not len(sharp) and split is None:
+        vn = np.stack([np.bincount(mesh.corners, fn[face, k] * angle, len(mesh.positions)) for k in range(3)], 1)
+        length = np.linalg.norm(vn, axis=1, keepdims=True)
+        return np.divide(vn, length, out=np.zeros_like(vn), where=length > 0)[mesh.corners]
+    group = smooth[face].astype(np.int64)
+    if len(sharp):
+        group[np.isin(blendmods._edge_keys(np.stack([mesh.corners, mesh.corners[nxt]], 1)), sharp)] = 0
+    keep = None
+    if split is not None:
+        limit = math.cos(split)
+
+        def keep(x, y):
+            return np.einsum("ij,ij->i", fn[face[x]], fn[face[y]]) >= limit
+    fan = _fans(mesh.corners, nxt, group, wound=True, keep=keep)
+    summed = np.stack([np.bincount(fan, fn[face, k] * angle, len(mesh.corners)) for k in range(3)], 1)
+    out = np.where(smooth[face][:, None], summed[fan], fn[face])
     length = np.linalg.norm(out, axis=1, keepdims=True)
     return np.divide(out, length, out=np.zeros_like(out), where=length > 0)
 

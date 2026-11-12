@@ -20,6 +20,7 @@ classifiers = [
 
 [project.optional-dependencies]
 images = ["Pillow>=10"]  # re-encode TGA/TIFF/PSD/... textures to PNG for glTF and USDZ
+usd = ["lz4>=4"]  # real LZ4 in binary USD files: faster to read, and smaller when written
 blend = ["backports.zstd>=1.0; python_version < '3.14'", "fonttools>=4.40"]  # compressed .blend files (Python 3.14 has zstd) and text objects
 dev = ["pytest>=8", "Pillow>=10", "trimesh>=4", "scipy>=1.10", "backports.zstd>=1.0; python_version < '3.14'",
        "fonttools>=4.40", "lz4>=4", "ruff>=0.16,<0.17"]

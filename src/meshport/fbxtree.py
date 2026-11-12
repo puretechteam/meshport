@@ -253,6 +253,12 @@ _NUMERIC = re.compile(r"[\s\d.,eE+\-]*")
 _INT = re.compile(r"[-+]?\d+")
 
 
+# Numbers that aren't finite, as Python and C's printf spell them (meshport's own ASCII writer among
+# them). Read as words, they would shift every value after them.
+_NOT_FINITE = {"inf": np.inf, "+inf": np.inf, "-inf": -np.inf, "infinity": np.inf, "-infinity": -np.inf,
+               "nan": np.nan, "-nan": np.nan}
+
+
 class _Count(int):
     """The *N before an ASCII array block."""
 
@@ -309,7 +315,9 @@ def _read_ascii(text: str) -> tuple[int, list[Record]]:
         elif kind == "count":
             cur.props.append(_Count(m.group("count")))
         else:
-            cur.props.append(m.group("word"))
+            word = m.group("word")
+            special = _NOT_FINITE.get(word.lower())
+            cur.props.append(word if special is None else special)
     return version, root.children
 
 

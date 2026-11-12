@@ -144,9 +144,17 @@ class FCurve:
             return np.full(frames.shape, y[0])
         out = np.empty(frames.shape)
         k = np.clip(np.searchsorted(x, frames, side="right") - 1, 0, len(keys) - 2)
-        for seg in np.unique(k):
-            sel = k == seg
-            out[sel] = self._segment(int(seg), frames[sel])
+        bez = (self.ipo[k] == BEZIER) & (x[k + 1] > x[k])
+        if bez.any():  # every Bezier segment at once: a baked action has a key on every frame
+            a, b, f = keys[k[bez]], keys[k[bez] + 1], frames[bez]
+            out[bez] = _bezier(a[:, 1], a[:, 2], b[:, 0], b[:, 1], np.clip(f, a[:, 1, 0], b[:, 1, 0]))
+        rest = np.flatnonzero(~bez)
+        if len(rest):  # the others segment by segment, each frame looked at once
+            rest = rest[np.argsort(k[rest], kind="stable")]
+            ks = k[rest]
+            cuts = np.flatnonzero(np.diff(ks)) + 1
+            for part in np.split(rest, cuts):
+                out[part] = self._segment(int(k[part[0]]), frames[part])
         before, after = frames < x[0], frames > x[-1]
         out[before] = y[0] + self._slope(0) * (frames[before] - x[0]) if self.extend else y[0]
         out[after] = y[-1] + self._slope(-1) * (frames[after] - x[-1]) if self.extend else y[-1]
@@ -240,21 +248,22 @@ def _generate(st: dict, t: np.ndarray, value: np.ndarray) -> np.ndarray:
 def _bezier(p0, p1, p2, p3, f: np.ndarray) -> np.ndarray:
     """The value of a keyframe's Bezier segment at frames f: its handles first shortened, together,
     so they don't reach past each other's key, then the curve solved for each frame."""
-    p0, p1, p2, p3 = (np.asarray(p, np.float64) for p in (p0, p1, p2, p3))
+    p0, p1, p2, p3 = (np.asarray(p, np.float64) for p in (p0, p1, p2, p3))  # each (2,), or (n, 2) for n frames
     h1, h2 = p0 - p1, p3 - p2
-    len1, len2, span = abs(h1[0]), abs(h2[0]), p3[0] - p0[0]
-    if len1 + len2 > span > 0:
-        fac = span / (len1 + len2)
-        p1, p2 = p0 - fac * h1, p3 - fac * h2
+    len1, len2, span = abs(h1[..., 0]), abs(h2[..., 0]), p3[..., 0] - p0[..., 0]
+    short = (len1 + len2 > span) & (span > 0)
+    fac = np.divide(span, len1 + len2, out=np.ones_like(span), where=short)[..., None]
+    p1 = np.where(short[..., None], p0 - fac * h1, p1)
+    p2 = np.where(short[..., None], p3 - fac * h2, p2)
     lo, hi = np.zeros_like(f), np.ones_like(f)
     for _ in range(48):  # x runs one way along the segment, so halving finds the parameter
         s = (lo + hi) / 2
         r = 1 - s
-        x = r ** 3 * p0[0] + 3 * r * r * s * p1[0] + 3 * r * s * s * p2[0] + s ** 3 * p3[0]
+        x = r ** 3 * p0[..., 0] + 3 * r * r * s * p1[..., 0] + 3 * r * s * s * p2[..., 0] + s ** 3 * p3[..., 0]
         lo, hi = np.where(x < f, s, lo), np.where(x < f, hi, s)
     s = (lo + hi) / 2
     r = 1 - s
-    return r ** 3 * p0[1] + 3 * r * r * s * p1[1] + 3 * r * s * s * p2[1] + s ** 3 * p3[1]
+    return r ** 3 * p0[..., 1] + 3 * r * r * s * p1[..., 1] + 3 * r * s * s * p2[..., 1] + s ** 3 * p3[..., 1]
 
 
 def _ease(ipo: int, easing: int, t, b: float, c: float, d: float, back: float, amplitude: float, period: float):

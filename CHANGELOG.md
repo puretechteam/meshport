@@ -2,6 +2,31 @@
 
 Newest first. Each entry is dated by when it landed.
 
+## 2026-11-12: meshport 0.5.0, sharp edges, faster curves and rigs, and a hardening pass
+
+- **Fixed: shading from .blend files now matches Blender's.** Sharp edges split the shading (hard-surface models used to come out smeared across them), and so do edges three faces share and neighbours wound opposite ways; files from before Blender 4.1 follow Auto Smooth and its angle. Smooth normals are weighted by each face's angle at the vertex, as Blender weights them, instead of by face area. On six test objects saved by Blender 5.1, every corner normal now matches Blender's own to 1e-5; they used to be up to 150 degrees off (6.6 on a plain smooth sphere). Custom split normals and the Smooth by Angle modifier are still left out.
+- **Fixed: an object scaled to 0** (a common way to hide things in Blender) made the whole .blend unreadable ("damaged (Singular matrix)"), and a skinned mesh under one made OBJ, 3DS and Alembic writing fail. Both work now, in every format.
+- **Fixed: very deep scenes.** FBX and glTF writing, glTF reading and 3DS parent chains recursed, so scenes over about 900 to 1,000 levels deep failed; 3,000 levels now write and read back. A 3DS chain of 8,000 nodes reads in 0.18 s.
+- **Fixed: a 3DS keyframer without a frame range** (KF_SEGMENT) made the whole file fail.
+- **Fixed: two textures with the same file name** (wood.png from two folders) were written over each other next to an OBJ, and saving next to a different file of the same name replaced it. OBJ, 3DS and USD writing now give such a texture a name of its own (`wood_1.png`); a file with the same bytes is reused.
+- **Fixed: USD references into a package on disk** (`@asset.usdz[model.usdc]@`) didn't resolve, and paths inside packages lost leading dots (`../tex.png` from a layer in `sub/` read `sub/tex.png`).
+- **Fixed: glTF images are held to the folder rule** every other format's textures follow (the model's folder and the one above); they used to be read from anywhere relative to the model.
+- **Fixed: a glTF node's own blend shape weights** were written onto its shared mesh, so every node showing that mesh took the last node's weights.
+- **Fixed: Array copies** of meshes over 1,000,000 points in all were cut short without a word (100,000 points times 20 gave 11 copies); hostile counts are still refused.
+- **Fixed: OBJ writing** kept 6 digits of each point, so a point 12 km out moved 2 cm (12345.678 became 12345.7); points now get 9 digits, enough for any 32-bit position (files grow about 9%).
+- **Fixed: ASCII FBX** files with `inf` or `nan` values read them as words, which shifted every value after them.
+- **Fixed:** `Scene.deformed()` dropped lights, and `Animation.bake()` had no limit on how many samples it made.
+- **Faster, same results:**
+  - A baked .blend action (a key on every frame): 4,000 Bezier keys take 0.016 s a curve, was 3.0 s.
+  - NURBS curves: 4,000 control points take 0.014 s, was 146 s (and 768 MB); values agree to 1e-15.
+  - Metaballs: 50 elements take 0.56 s, was 27.9 s, with the same mesh; at most 100,000 elements a family.
+  - Long Alembic animations: 8,000 frames read in 0.13 s, was 1.40 s.
+  - USD and Alembic writing of rigs: a 60-bone chain over 400 frames takes 0.44 s, was 2.4 s, with the same poses.
+  - Vertex weights from .blend files: 160,000 weighted vertices in 0.48 s, was 1.10 s; connected Weld on a million points 1.42 s, was 1.72 s; .blend struct tables 10 to 15% faster.
+  - A filled 2D curve outline over about 4,000 points is now fanned, as huge concave faces already were: 8,000 points took 15 s and 50,000 would take hours.
+  - Objects shown by many collection instances get their modifiers applied once, so a big scene of instances is no longer refused for making too much geometry.
+- **Added: a `usd` extra** (`pip install "meshport[usd] @ ..."`) for real LZ4 in binary USD files.
+
 ## 2026-11-05: meshport 0.4.1, unused code removed
 
 - **Removed code nothing used,** with no change to what meshport reads or writes: `source_of` and `_revolve`'s `round_cap` in USD, and constants nothing looks at. The suite gives the same results.

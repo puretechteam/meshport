@@ -140,8 +140,6 @@ def continuous(degrees: np.ndarray) -> np.ndarray:
     return np.array(rows, np.float64).reshape(-1, 3)
 
 
-
-
 def time_mode(fps: float) -> tuple[int, float]:
     """GlobalSettings TimeMode and CustomFrameRate for a frame rate."""
     for mode, rate in FRAME_RATES.items():

@@ -28,7 +28,14 @@ import struct
 
 import numpy as np
 
-from .geometry import compose_trs, decompose_many, decompose_trs, scaling, translation
+from .geometry import (
+    compose_trs,
+    decompose_many,
+    decompose_trs,
+    safe_inverse,
+    scaling,
+    translation,
+)
 from .scene import (
     DAMAGED,
     MAX_FRAMES,
@@ -66,6 +73,7 @@ class _File:
             raise MeshportError("This isn't an Alembic file")
         self.data = data
         self.visits = 0
+        self._groups: dict[int, list[int]] = {}  # each group read once: an animated property's samples are read one by one
 
     def _u64(self, at: int) -> int:
         if at < 0 or at + 8 > len(self.data):
@@ -77,13 +85,16 @@ class _File:
             raise MeshportError("This Alembic file is damaged (data where a group should be)")
         if ref == 0:
             return []
+        if ref in self._groups:
+            return self._groups[ref]
         self.visits += 1
         if self.visits > 10_000_000:
             raise MeshportError("This Alembic file is damaged (its tree loops)")
         n = self._u64(ref)
         if n > (len(self.data) - ref - 8) // 8:
             raise MeshportError("This Alembic file is damaged (a group is cut short)")
-        return list(np.frombuffer(self.data, "<u8", n, ref + 8).tolist())
+        self._groups[ref] = got = list(np.frombuffer(self.data, "<u8", n, ref + 8).tolist())
+        return got
 
     def block(self, ref: int) -> memoryview:
         if not ref & _DATA:
@@ -283,7 +294,7 @@ class _Reader:
             return []
         m = np.array([self._xform_matrix(props, i) for i in range(n)])
         if parent_world is not None:
-            m = np.linalg.inv(parent_world) @ m
+            m = safe_inverse(parent_world) @ m
         order = np.argsort(times, kind="stable")
         out = []
         for name, values in zip(("translation", "rotation", "scale"), decompose_many(m[order])):
@@ -310,7 +321,7 @@ class _Reader:
         node = Node(name)
         if schema.startswith("AbcGeom_Xform"):
             local, inherits = self._xform(props.get(".xform"))
-            node.matrix = local if inherits else np.linalg.inv(parent_world) @ local
+            node.matrix = local if inherits else safe_inverse(parent_world) @ local
             vals = self.compound(props[".xform"].ref).get(".vals") if ".xform" in props else None
             if vals is not None and vals.samples > 1 and vals.last > 0:
                 self.animated.append((node, props[".xform"], None if inherits else parent_world))
@@ -711,15 +722,17 @@ class _Writer:
             self.frames = start + np.arange(round((end - start) * self.fps) + 1) / self.fps
         if bending:
             copies = dict(zip((id(n) for n, _ in scene.walk()), (n for n, _ in flat.walk())))
-            for t in self.frames:
-                worlds = {id(n): w for n, w in scene.walk_at(float(t), animation)}
-                for node in bending:
-                    points = node.mesh.morphed(animation.weights(node, float(t)))
-                    if node.skin is not None:
-                        joints = np.array([worlds[id(j)] for j in node.skin.joints]).reshape(-1, 4, 4)
-                        inverse = np.linalg.inv(worlds[id(node)])
-                        points = node.skin.pose(points, joints) @ inverse[:3, :3].T + inverse[:3, 3]
-                    self.bent.setdefault(id(copies[id(node)]), []).append(points)
+            for a in range(0, len(self.frames), 256):  # every channel sampled once per few hundred frames
+                chunk = self.frames[a:a + 256]
+                worlds = {id(n): w for n, w in scene.walk_over(chunk, animation)}
+                for i, t in enumerate(chunk):
+                    for node in bending:
+                        points = node.mesh.morphed(animation.weights(node, float(t)))
+                        if node.skin is not None:
+                            joints = np.array([worlds[id(j)][i] for j in node.skin.joints]).reshape(-1, 4, 4)
+                            inverse = safe_inverse(worlds[id(node)][i])
+                            points = node.skin.pose(points, joints) @ inverse[:3, :3].T + inverse[:3, 3]
+                        self.bent.setdefault(id(copies[id(node)]), []).append(points)
         taken: set[str] = set()
         return self.finish([self._node(n, taken) for n in flat.roots])
 

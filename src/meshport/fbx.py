@@ -49,6 +49,7 @@ from .geometry import (
     euler,
     euler_many,
     rotations,
+    safe_inverse,
     scaling,
     transform_normals,
     transform_points,
@@ -56,6 +57,7 @@ from .geometry import (
     unique_rows,
 )
 from .scene import (
+    _EXT,
     DAMAGED,
     PATHS,
     WEIGHTS,
@@ -69,12 +71,11 @@ from .scene import (
     Node,
     Scene,
     Skin,
+    TextureFinder,
     frame_grid,
     frame_rate,
     inbetween_weights,
-    linked_path,
     pack_influences,
-    read_image_file,
     too_many_frames,
     with_crossings,
 )
@@ -343,7 +344,7 @@ class _Reader:
         pre, post = (o.prop("PreRotation", zero), o.prop("PostRotation", zero)) if active else (zero, zero)
         order = EULER_ORDERS[min(max(o.prop("RotationOrder", 0), 0), 5)]
         before = translation(r_off) @ translation(r_piv) @ euler(pre)
-        after = (np.linalg.inv(euler(post)) @ translation(-np.array(r_piv)) @ translation(s_off)
+        after = (safe_inverse(euler(post)) @ translation(-np.array(r_piv)) @ translation(s_off)
                  @ translation(s_piv))
         return before, after, translation(-np.array(s_piv)), order
 
@@ -762,91 +763,13 @@ class _Reader:
             if content is not None:
                 data = decode_content(content.props)
         if not data:
-            data = self._find_file(names) or b""
+            data = self.finder.find(names) or b""
         label = tex.name or (Path(names[0].replace("\\", "/")).stem if names else "texture")
         image = Image(label, data or None, names[0] if names else None)
         if image.data is None and image.path is None:
             image = None
         self.images[tex.id] = image
         return image
-
-    def _find_file(self, names: list[str]) -> bytes | None:
-        return self.finder.find(names)
-
-
-_TEXTURE_DIRS = frozenset({"texture", "textures", "tex", "materials", "images", "maps"})
-
-
-class TextureFinder:
-    """Finds the texture files a model points at. Shared by the FBX and 3DS readers."""
-
-    def __init__(self, base_dir: Path | None):
-        self.base_dir = base_dir.resolve() if base_dir is not None else None
-        self.root = self.base_dir.parent if self.base_dir is not None else None
-        self._files: dict[str, Path] | None = None
-
-    def find(self, names: list[str]) -> bytes | None:
-        """Texture paths in model files usually point at the artist's own drive. Files are only
-        read from the model's folder and the folder above it (and below them): a path is tried
-        as written when it's relative and stays in there, then its file name next to the model,
-        in texture folders there or one level up (Pack/Models/x.fbx -> Pack/Textures/), and
-        anywhere under the folder above the model. Absolute, network and URL paths are never
-        opened, and only image files are taken, so a model can't pull other files into the
-        output. Without a folder (bytes read on their own), nothing is looked up."""
-        if self.base_dir is None:
-            return None
-        bases = []
-        for n in names:
-            bases.append(n.replace("\\", "/").rsplit("/", 1)[-1].lower())
-            path = linked_path(n, self.base_dir, self.root)
-            data = read_image_file(path) if path is not None else None
-            if data is not None:
-                return data
-        listing = self._listing()
-        for base in bases:
-            if base in listing:
-                path = linked_path(listing[base].name, listing[base].parent, self.root)  # a link can't lead out
-                data = read_image_file(path) if path is not None else None
-                if data is not None:
-                    return data
-        return None
-
-    def _listing(self) -> dict[str, Path]:
-        """Lower-case file name -> path, nearest folders first, capped so a model in a huge
-        folder doesn't stall the read."""
-        if self._files is not None:
-            return self._files
-        files: dict[str, Path] = {}
-
-        def add(folder: Path):
-            try:
-                for f in folder.iterdir():
-                    if f.is_file():
-                        files.setdefault(f.name.lower(), f)
-            except OSError:
-                pass
-
-        add(self.base_dir)
-        for fbm in self.base_dir.glob("*.fbm"):
-            add(fbm)
-        for up in (self.base_dir, self.base_dir.parent):
-            try:
-                subdirs = [d for d in up.iterdir() if d.is_dir() and d.name.lower() in _TEXTURE_DIRS]
-            except OSError:
-                subdirs = []
-            for d in subdirs:
-                add(d)
-        budget = 20000
-        for dirpath, dirnames, filenames in os.walk(self.base_dir.parent):
-            dirnames.sort()
-            for f in filenames:
-                files.setdefault(f.lower(), Path(dirpath) / f)
-            budget -= len(filenames) + 1
-            if budget <= 0:
-                break
-        self._files = files
-        return files
-
 
 def _matrix(values: np.ndarray | None) -> np.ndarray:
     """An FBX matrix (16 numbers, translation last) as a column-vector one, identity when missing."""
@@ -890,10 +813,6 @@ def _fbx_name(name: str, cls: str) -> str:
     return f"{name.replace(chr(0), '').replace(chr(1), '')}\x00\x01{cls}"
 
 
-_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/tiff": "tif",
-        "image/bmp": "bmp", "image/vnd-ms.dds": "dds", "image/vnd.adobe.photoshop": "psd", "image/gif": "gif"}
-
-
 class _Writer:
     def __init__(self, scene: Scene):
         self.scene = scene
@@ -921,7 +840,7 @@ class _Writer:
                 bind = self.skins[id(n)].bind_space(self.rest)
                 if bind is not None:
                     above = self.rest[id(parent[id(n)])] if id(n) in parent else np.eye(4)
-                    self.placed[id(n)] = np.linalg.inv(above) @ bind
+                    self.placed[id(n)] = safe_inverse(above) @ bind
                     self.rest[id(n)] = bind
         self.pending: list[tuple[np.int64, Node]] = []  # skinned geometries, once every model has an id
         self.skinned: set[tuple[int, int]] = set()
@@ -1124,7 +1043,14 @@ class _Writer:
 
     # ---- objects
 
-    def _model(self, node: Node, parent_id: np.int64):
+    def _model(self, root: Node, parent_id: np.int64):
+        stack = [(root, parent_id)]  # a loop, not recursion: a scene can be thousands of nodes deep
+        while stack:
+            node, parent_id = stack.pop()
+            mid = self._one_model(node, parent_id)
+            stack.extend((child, mid) for child in reversed(node.children))
+
+    def _one_model(self, node: Node, parent_id: np.int64) -> np.int64:
         mid = self._id()
         t, r, s = decompose(self.placed.get(id(node), node.matrix))
         props = [_p_vec("Lcl Translation", "Lcl Translation", "", "A", t),
@@ -1154,8 +1080,7 @@ class _Writer:
                 self.pending.append((gid, node))
             for mat in node.materials:
                 self._connect("OO", self._material(mat), mid)
-        for child in node.children:
-            self._model(child, mid)
+        return mid
 
     def _geometry(self, mesh: Mesh, skin: Skin | None = None) -> np.int64:
         key = (id(mesh), id(skin))  # a skin deforms its geometry: one mesh, two skins, two geometries

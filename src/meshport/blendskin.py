@@ -27,6 +27,7 @@ import re
 
 import numpy as np
 
+from .geometry import safe_inverse
 from .scene import Morph, Node
 
 _BONE_PATH = re.compile(r'^pose\.bones\["((?:[^"\\]|\\.)*)"\]\.(\w+)$')
@@ -88,7 +89,7 @@ class Rig:
             if name in self.nodes:
                 continue
             rest = _matrix(bone.get("arm_mat"))
-            relative = rest if parent is None else np.linalg.inv(self.rest[parent]) @ rest
+            relative = rest if parent is None else safe_inverse(self.rest[parent]) @ rest
             self.rest[name], self.relative[name] = rest, relative
             hinge = bool(int(bone.get("flag", 0) or 0) & _BONE_HINGE)
             scale = int(bone.get("inherit_scale_mode", 0) or 0)
@@ -137,7 +138,7 @@ class Rig:
     def locals(self, bases: dict) -> dict[str, np.ndarray]:
         """Each bone node's matrix (relative to the node it hangs under) for these channel transforms."""
         poses = self.poses(bases)
-        return {n: poses[n] if n not in self.attached else np.linalg.inv(poses[self.attached[n]]) @ poses[n]
+        return {n: poses[n] if n not in self.attached else safe_inverse(poses[self.attached[n]]) @ poses[n]
                 for n in self.order}
 
 
@@ -211,34 +212,42 @@ def vertex_weights(f, me, count: int) -> tuple[np.ndarray, np.ndarray, np.ndarra
     size = f.struct_size["MDeformVert"]
     if at + size * count > blk.length:
         return None
-    rows, groups, weights = [], [], []
     wsize = f.struct_size.get("MDeformWeight", 8)
-    lists: dict[tuple[int, int], tuple | None] = {}  # (address, count) -> its weights: vertices can share one
+    fields = _S(f, "MDeformVert", blk.offset + at, blk.scope).fields
+    if "dw" not in fields or "totweight" not in fields:
+        return None
+    # every vertex's weight count and list pointer at once, straight from the array of MDeformVerts
+    ptr_dtype = np.dtype(f.ptr_dtype)
+    dws = np.ndarray((count,), ptr_dtype, f.data, blk.offset + at + fields["dw"][0], (size,)).astype(np.uint64)
+    totals = np.ndarray((count,), "<i4", f.data, blk.offset + at + fields["totweight"][0], (size,)).astype(np.int64)
+    pair = np.dtype([("def_nr", "<i4"), ("weight", "<f4")])
+    lists: dict[tuple[int, int], np.ndarray | None] = {}  # (address, count) -> its weights: vertices can share one
     left = WEIGHT_BUDGET
-    for v in range(count):
-        dv = _S(f, "MDeformVert", blk.offset + at + v * size, blk.scope)
-        n = int(dv.get("totweight", 0) or 0)
-        if n <= 0:
-            continue
-        key = (dv.get("dw", 0), n)
-        if key not in lists:
+    vertices, counts, parts = [], [], []
+    for v in np.flatnonzero(totals > 0).tolist():
+        n = int(totals[v])
+        key = (int(dws[v]), n)
+        got_list = lists.get(key, False)
+        if got_list is False:
             hit = f.at(key[0], blk.scope)
             if hit is None or n > 4096 or hit[1] + wsize * n > hit[0].length or wsize != 8:
-                lists[key] = None
+                got_list = None
             else:
-                raw = np.frombuffer(f.data, np.dtype([("def_nr", "<i4"), ("weight", "<f4")]), n, hit[0].offset + hit[1])
-                lists[key] = (raw["def_nr"].astype(np.int64), raw["weight"].astype(np.float64))
-        if lists[key] is None:
+                got_list = np.frombuffer(f.data, pair, n, hit[0].offset + hit[1])
+            lists[key] = got_list
+        if got_list is None:
             continue
         left -= n
         if left < 0:
             raise MeshportError(f"This mesh has too many vertex group weights (over {WEIGHT_BUDGET:,})")
-        rows.append(np.full(n, v))
-        groups.append(lists[key][0])
-        weights.append(lists[key][1])
-    if not rows:
+        vertices.append(v)
+        counts.append(n)
+        parts.append(got_list)
+    if not parts:
         return np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0)
-    return np.concatenate(rows), np.concatenate(groups), np.concatenate(weights)
+    joined = np.concatenate(parts)
+    rows = np.repeat(np.array(vertices, np.int64), counts)
+    return rows, joined["def_nr"].astype(np.int64), joined["weight"].astype(np.float64)
 
 
 def shape_keys(f, ob, me, count: int) -> list[tuple[str, np.ndarray, float]]:

@@ -29,7 +29,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from .geometry import transform_points, translation, triangulate, unique_rows
+from .geometry import (
+    safe_inverse,
+    transform_points,
+    translation,
+    triangulate,
+    unique_rows,
+)
 from .scene import Budget, Mesh
 
 MAX_GENERATED = 100_000_000  # corners one .blend file's modifiers and curves may make in all
@@ -67,7 +73,7 @@ class Context:
     def relative(self, address: int) -> np.ndarray | None:
         """Another object's matrix in this object's space, or None if it isn't there."""
         world = self.world_of(address) if address else None
-        return None if world is None else np.linalg.inv(self.ob_world) @ world
+        return None if world is None else safe_inverse(self.ob_world) @ world
 
 
 def stack(ob) -> list:
@@ -324,19 +330,21 @@ def _weld(mesh: Mesh, smooth: np.ndarray, md, ctx: Context):
         _, nxt, _ = _topology(mesh.face_sizes)
         edges, _ = _edges(mesh.corners, nxt)
         short = edges[np.linalg.norm(p[edges[:, 0]] - p[edges[:, 1]], axis=1) <= dist]
-        parent = np.arange(n)
-
-        def root(v):
-            while parent[v] != v:
-                parent[v] = parent[parent[v]]
-                v = parent[v]
-            return v
-
-        for a, b in short.tolist():
-            ra, rb = root(a), root(b)
-            if ra != rb:
-                parent[max(ra, rb)] = min(ra, rb)
-        target = np.array([root(v) for v in range(n)], np.int64) if len(short) else target
+        if len(short):  # each point joins the lowest-numbered point it's linked to by short edges
+            a, b = short[:, 0], short[:, 1]
+            label = np.arange(n)  # label[v] is v's tree root; a root hooks onto the lowest root next to it
+            while True:
+                ra, rb = label[a], label[b]
+                apart = ra != rb
+                if not apart.any():
+                    break
+                np.minimum.at(label, np.maximum(ra[apart], rb[apart]), np.minimum(ra[apart], rb[apart]))
+                while True:  # every point to its root again (a few passes: the trees double in reach)
+                    up = label[label]
+                    if (up == label).all():
+                        break
+                    label = up
+            target = label
     else:  # all: each point, in order, takes the points near it that nothing has taken yet
         i, j, _ = _close_pairs(p, p, dist)
         later = j > i
@@ -375,7 +383,7 @@ def _mirror(mesh: Mesh, smooth: np.ndarray, md, ctx: Context):
     for axis in range(3):
         if not flag & (_MIR_AXIS_X << axis):
             continue
-        to_plane = np.eye(4) if mirror_space is None else np.linalg.inv(mirror_space)  # object -> mirror space
+        to_plane = np.eye(4) if mirror_space is None else safe_inverse(mirror_space)  # object -> mirror space
         if flag & (_MIR_BISECT_X << axis):
             keep_negative = bool(flag & (_MIR_FLIP_X << axis))
             mesh, smooth = _bisect(mesh, smooth, to_plane, axis, keep_negative,
@@ -384,7 +392,7 @@ def _mirror(mesh: Mesh, smooth: np.ndarray, md, ctx: Context):
                 return mesh, smooth
         flip = np.eye(4)
         flip[axis, axis] = -1
-        reflect = np.linalg.inv(to_plane) @ flip @ to_plane
+        reflect = safe_inverse(to_plane) @ flip @ to_plane
         p = mesh.positions
         q = transform_points(reflect, p)
         n = len(p)
@@ -426,7 +434,7 @@ def _bisect(mesh: Mesh, smooth: np.ndarray, to_plane: np.ndarray, axis: int, kee
     if on.any():  # snap onto the plane
         local = transform_points(to_plane, p[on])
         local[:, axis] = 0
-        p[on] = transform_points(np.linalg.inv(to_plane), local)
+        p[on] = transform_points(safe_inverse(to_plane), local)
         side = np.where(on, 0.0, side)
     face, nxt, _ = _topology(mesh.face_sizes)
     inside = side >= 0
@@ -514,13 +522,13 @@ def _array(mesh: Mesh, smooth: np.ndarray, md, ctx: Context):
         dist = float(np.linalg.norm(step[:3, 3]))
         length = float(md.get("length", 0.0))
         count = int(length / dist * (1 + 1e-5)) + 1 if dist > _FLT_EPSILON else 1  # an exact fit counts
-    count = max(1, min(count, 1_000_000 // max(len(p), 1) + 1))
+    count = max(1, count)
     # caps: other objects' meshes, as they are in their own space, one step before the first copy and
     # one past the last (Blender doesn't look at where the cap objects themselves stand)
     caps = [ctx.mesh_of(int(md.get(field, 0) or 0)) for field in ("start_cap", "end_cap")]
     if count == 1 and caps == [None, None]:
         return mesh, smooth
-    ctx.budget.need(count * len(mesh.corners) + sum(len(c[0].corners) for c in caps if c is not None))
+    ctx.budget.need(count * max(len(mesh.corners), len(p), 1) + sum(len(c[0].corners) for c in caps if c is not None))
     uv_offset = np.asarray(md.get("uv_offset", np.zeros(2)), np.float64)
     copies, matrix = [], np.eye(4)
     for k in range(count):
@@ -529,7 +537,7 @@ def _array(mesh: Mesh, smooth: np.ndarray, md, ctx: Context):
     n = len(p)
     parts, smooths = list(copies), [smooth] * count
     placed = []  # (first point, cap points, the copy it meets)
-    for cap, place, meets in zip(caps, (np.linalg.inv(step), matrix), (0, count - 1)):
+    for cap, place, meets in zip(caps, (safe_inverse(step), matrix), (0, count - 1)):
         if cap is None:
             continue
         cap_mesh = _like(cap[0], mesh, ctx.n_materials)

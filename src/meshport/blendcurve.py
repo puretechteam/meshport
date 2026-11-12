@@ -35,7 +35,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .scene import Mesh, linked_path
+from .geometry import safe_inverse
+from .scene import Mesh, MeshportError, linked_path
 
 # Curve.flag
 _CU_3D, _CU_FRONT, _CU_BACK, _CU_FILL_CAPS = 1, 2, 4, 16384
@@ -54,6 +55,10 @@ _MB_BALL, _MB_TUBE, _MB_PLANE, _MB_ELLIPSOID, _MB_CUBE = 0, 4, 5, 6, 7
 _MB_TUBE_AXES = {1: 0, 2: 1, 3: 2}  # old single-axis tubes
 _MB_NEGATIVE, _MB_HIDE = 2, 8
 _MAX_POINTS = 4_000_000
+MAX_METABALL_ELEMENTS = 100_000  # elements in one metaball family (real ones have tens)
+# Ear clipping an outline of n points takes up to about n * n steps (4,000 points: about 2 seconds): this
+# many per curve. A bigger outline is fanned, as geometry.triangulate does with huge concave faces.
+FILL_BUDGET = 16_000_000
 
 
 class _Spline:
@@ -196,30 +201,34 @@ def _knots(n: int, order: int, flag: int) -> np.ndarray:
     return np.arange(total, dtype=np.float64)
 
 
-def _basis(knots: np.ndarray, order: int, u: np.ndarray, count: int) -> np.ndarray:
-    """(len(u), count) B-spline basis values (Cox-de Boor)."""
-    k = knots
+def _basis(knots: np.ndarray, order: int, u: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """For each u, the order B-spline basis functions that aren't zero there (de Boor's triangle, The NURBS
+    Book's BasisFuns): (len(u), order) control point numbers and their values. Only those order of them
+    are worked out, so a curve's cost grows with its samples, not samples times control points."""
+    k = np.asarray(knots, np.float64)
     last = len(k) - 1
-    b = np.zeros((len(u), last))
-    for i in range(last):
-        if k[i] < k[i + 1]:
-            b[:, i] = (u >= k[i]) & (u < k[i + 1])
-    # the end of the range belongs to the last non-empty span
-    end = u >= k[last]
-    if end.any():
-        span = max(i for i in range(last) if k[i] < k[i + 1]) if (k[:-1] < k[1:]).any() else 0
-        b[end] = 0
-        b[end, span] = 1
-    for d in range(1, order):
-        nb = np.zeros((len(u), last - d))
-        for i in range(last - d):
-            left, right = k[i + d] - k[i], k[i + d + 1] - k[i + 1]
-            if left > 0:
-                nb[:, i] += (u - k[i]) / left * b[:, i]
-            if right > 0:
-                nb[:, i] += (k[i + d + 1] - u) / right * b[:, i + 1]
-        b = nb
-    return b[:, :count]
+    nonempty = np.flatnonzero(k[:-1] < k[1:])
+    if not len(nonempty):
+        return np.zeros((len(u), order), np.int64), np.zeros((len(u), order))
+    span = np.searchsorted(k, u, side="right") - 1
+    span = np.where(u >= k[last], nonempty[-1], span)  # the end of the range belongs to the last span
+    span = np.clip(span, nonempty[0], nonempty[-1])
+    span = nonempty[np.clip(np.searchsorted(nonempty, span, side="right") - 1, 0, len(nonempty) - 1)]
+    p = order - 1
+    values = np.zeros((len(u), order))
+    values[:, 0] = 1.0
+    left, right = np.zeros((len(u), order)), np.zeros((len(u), order))
+    for j in range(1, order):
+        left[:, j] = u - k[np.clip(span + 1 - j, 0, last)]
+        right[:, j] = k[np.clip(span + j, 0, last)] - u
+        saved = np.zeros(len(u))
+        for r in range(j):
+            den = right[:, r + 1] + left[:, j - r]
+            temp = np.divide(values[:, r], den, out=np.zeros(len(u)), where=den != 0)
+            values[:, r] = saved + right[:, r + 1] * temp
+            saved = left[:, j - r] * temp
+        values[:, j] = saved
+    return span[:, None] - p + np.arange(order), values
 
 
 def _nurbs(vec, tilt, radius, order, flag, resolution, material, smooth, knots) -> _Spline | None:
@@ -237,14 +246,17 @@ def _nurbs(vec, tilt, radius, order, flag, resolution, material, smooth, knots) 
     samples = max(resolution * (n if cyclic else n - 1), 2)
     u = start + (end - start) * np.arange(samples) / (samples if cyclic else samples - 1)
     u = np.minimum(u, np.nextafter(end, -np.inf))  # the end of the range, from its own span
-    basis = _basis(knots, order, u, count)
+    index, basis = _basis(knots, order, u)
+    used = (index >= 0) & (index < count)
+    index = np.clip(index, 0, count - 1)
     w = vec[:, 3].copy()
     w[w <= 0] = 1.0
-    wb = basis * w
+    wb = np.where(used, basis * w[index], 0.0)
     total = wb.sum(1, keepdims=True)
     total[total == 0] = 1.0
     wb /= total
-    return _Spline(wb @ vec[:, :3], wb @ tilt, wb @ radius, cyclic, material, smooth)
+    points = np.einsum("so,soc->sc", wb, vec[index, :3])
+    return _Spline(points, (wb * tilt[index]).sum(1), (wb * radius[index]).sum(1), cyclic, material, smooth)
 
 
 # ---- sweeping
@@ -480,6 +492,8 @@ def _fill(loops: list[np.ndarray]) -> np.ndarray:
     depth = [sum(_inside(lp[0], other) for j, other in enumerate(loops) if j != i) for i, lp in enumerate(loops)]
     areas = [abs(_area(lp)) for lp in loops]
     out = []
+    flat = np.concatenate(loops)
+    budget = FILL_BUDGET
     for i, lp in enumerate(loops):
         if depth[i] % 2:
             continue
@@ -494,12 +508,17 @@ def _fill(loops: list[np.ndarray]) -> np.ndarray:
         if _area(lp) < 0:
             idx = idx[::-1]
         ring = list(idx)
-        flat = np.concatenate(loops)
         for j in sorted(holes, key=lambda h: -loops[h][:, 0].max()):
             hidx = np.arange(offsets[j], offsets[j + 1])
             if _area(loops[j]) > 0:
                 hidx = hidx[::-1]
             ring = _bridge(flat, ring, list(hidx))
+        n = len(ring)
+        if n * n > budget:
+            r = np.array(ring, np.int64)
+            out.append(np.stack([np.full(n - 2, r[0]), r[1:-1], r[2:]], 1) if n >= 3 else np.zeros((0, 3), np.int64))
+            continue
+        budget -= n * n
         out.append(_ear_clip(flat, ring))
     out = [t for t in out if len(t)]
     return np.concatenate(out) if out else np.zeros((0, 3), np.int64)
@@ -753,7 +772,7 @@ def _text_splines(cu, base_dir: Path | None) -> list[_Spline]:
         unit = 1.0 / max(int(head.yMax) - int(head.yMin), 1)  # Blender scales glyphs by the font's height
         if builtin:
             unit = _BUILTIN_CAP_HEIGHT / _cap_height(font, glyphs, cmap)
-    except Exception:  # noqa: BLE001 - a damaged or unsupported font: no text
+    except Exception:
         return []
     size = float(cu.get("fsize", 1.0))
     scale = unit * size
@@ -767,7 +786,7 @@ def _text_splines(cu, base_dir: Path | None) -> list[_Spline]:
     infos = _char_materials(cu, len(text))
     outlines, widths = [], []
     k = 0
-    for row, line in enumerate(lines):
+    for line in lines:
         x = 0.0
         placed = []
         for ch in line:
@@ -780,7 +799,7 @@ def _text_splines(cu, base_dir: Path | None) -> list[_Spline]:
                 pen = _outline_pen(glyphs)
                 try:
                     glyph.draw(pen)
-                except Exception:  # noqa: BLE001 - a broken glyph is left out
+                except Exception:
                     pen.contours = []
                 placed.append((pen.contours, x, infos[k] if k < len(infos) else 0))
             x += advance + extra
@@ -841,18 +860,23 @@ def metaball_mesh(elements: list[tuple[int, int, np.ndarray, float, float, np.nd
     elements = [e for e in elements if not e[1] & _MB_HIDE and e[3] > 0]
     if not elements or threshold <= 0:
         return None
+    if len(elements) > MAX_METABALL_ELEMENTS:
+        raise MeshportError(f"This metaball has too many elements ({len(elements):,})")
     resolution = max(float(resolution), 1e-4)
     lo, hi = np.full(3, np.inf), np.full(3, -np.inf)
-    for kind, flag, matrix, radius, stiff, dims in elements:
-        if flag & _MB_NEGATIVE:
-            continue
+    boxes = []  # each element's reach in the base object's space: its field is 0 outside it
+    for kind, flag, matrix, radius, _stiff, dims in elements:
         if kind == _MB_ELLIPSOID:
             reach = radius * np.abs(np.asarray(dims, np.float64))
         else:
             reach = radius + _extent(kind, dims)
         corners = np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]) * reach
         world = corners @ matrix[:3, :3].T + matrix[:3, 3]
-        lo, hi = np.minimum(lo, world.min(0)), np.maximum(hi, world.max(0))
+        # a flattened element (scaled to 0 one way) reaches past its own box: give it everything
+        flat = not abs(np.linalg.det(matrix[:3, :3])) > 1e-12
+        boxes.append(None if flat else (world.min(0), world.max(0)))
+        if not flag & _MB_NEGATIVE:
+            lo, hi = np.minimum(lo, world.min(0)), np.maximum(hi, world.max(0))
     if not np.isfinite(lo).all():
         return None
     lo, hi = lo - resolution, hi + resolution
@@ -861,17 +885,52 @@ def metaball_mesh(elements: list[tuple[int, int, np.ndarray, float, float, np.nd
         resolution *= (np.prod(counts.astype(np.float64)) / 8e6) ** (1 / 3)
         counts = np.ceil((hi - lo) / resolution).astype(np.int64) + 1
     axes = [lo[k] + resolution * np.arange(counts[k]) for k in range(3)]
-    grid = np.stack(np.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
-    inverses = [np.linalg.inv(e[2][:3, :3]) for e in elements]
+    inverses = [safe_inverse(e[2][:3, :3]) for e in elements]
+
+    def add(out, points, e):
+        kind, flag, matrix, radius, stiff, dims = elements[e]
+        local = (points - matrix[:3, 3]) @ inverses[e].T
+        out += (-1 if flag & _MB_NEGATIVE else 1) * _density(kind, local, radius, stiff, dims)
 
     def field(points):
+        """The field at any points, each element added only where it reaches (the same sums: the
+        points it skips would add 0)."""
         out = np.full(len(points), -threshold)
-        for (kind, flag, matrix, radius, stiff, dims), inv in zip(elements, inverses):
-            local = (points - matrix[:3, 3]) @ inv.T
-            out += (-1 if flag & _MB_NEGATIVE else 1) * _density(kind, local, radius, stiff, dims)
+        order = np.argsort(points[:, 0], kind="stable")
+        xs = points[order, 0]
+        for e, box in enumerate(boxes):
+            if box is None:
+                add(out, points, e)
+                continue
+            a, b = np.searchsorted(xs, box[0][0], "left"), np.searchsorted(xs, box[1][0], "right")
+            near = order[a:b]
+            q = points[near]
+            near = near[((q[:, 1:] >= box[0][1:]) & (q[:, 1:] <= box[1][1:])).all(1)]
+            if len(near):
+                part = np.zeros(len(near))
+                add(part, points[near], e)
+                out[near] += part
         return out
 
-    got = _march(field(grid).reshape(tuple(counts)), lo, resolution, field)
+    grid = np.full(tuple(counts), -threshold)  # the field on the grid, each element over its own box
+    for e, box in enumerate(boxes):
+        if box is None:
+            whole = np.stack(np.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
+            part = np.zeros(len(whole))
+            add(part, whole, e)
+            grid += part.reshape(grid.shape)
+            continue
+        first = np.clip(np.floor((box[0] - lo) / resolution).astype(np.int64), 0, counts)
+        last = np.clip(np.ceil((box[1] - lo) / resolution).astype(np.int64) + 1, 0, counts)
+        if (last <= first).any():
+            continue
+        cut = tuple(slice(int(f), int(t)) for f, t in zip(first, last))
+        pts = np.stack(np.meshgrid(*[ax[c] for ax, c in zip(axes, cut)], indexing="ij"), -1).reshape(-1, 3)
+        part = np.zeros(len(pts))
+        add(part, pts, e)
+        grid[cut] += part.reshape(grid[cut].shape)
+
+    got = _march(grid, lo, resolution, field)
     if got is None:
         return None
     positions, tris = got

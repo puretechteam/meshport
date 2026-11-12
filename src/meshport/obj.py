@@ -13,9 +13,9 @@ from pathlib import Path
 
 import numpy as np
 
-from .fbx import _EXT, TextureFinder
 from .geometry import transform_normals, transform_points, unique_rows
 from .scene import (
+    _EXT,
     DAMAGED,
     Image,
     Material,
@@ -23,8 +23,10 @@ from .scene import (
     MeshportError,
     Node,
     Scene,
+    TextureFinder,
     linked_path,
     node_budget,
+    replaces_other_file,
 )
 
 # ============================================================================ reading
@@ -401,9 +403,11 @@ def _shaded_normals(mesh: Mesh, smooth: np.ndarray) -> np.ndarray:
     return _unit(np.where((group > 0)[:, None], summed[fan], fn[face]))
 
 
-def _fans(corners: np.ndarray, nxt: np.ndarray, group: np.ndarray) -> np.ndarray:
+def _fans(corners: np.ndarray, nxt: np.ndarray, group: np.ndarray, wound: bool = False, keep=None) -> np.ndarray:
     """For each corner, the lowest corner of its fan: the corners at the same vertex whose faces
-    meet along an edge used by exactly two faces of the same smoothing group."""
+    meet along an edge used by exactly two faces of the same smoothing group. group is per corner,
+    for the edge from it to the next corner. wound: only where the two faces run the edge opposite
+    ways (as faces wound alike do). keep(x, y) can refuse more of the joins, by their two corners."""
     lo, hi = np.minimum(corners, corners[nxt]), np.maximum(corners, corners[nxt])
     order = np.lexsort((hi, lo))
     same = (lo[order][1:] == lo[order][:-1]) & (hi[order][1:] == hi[order][:-1])
@@ -411,8 +415,12 @@ def _fans(corners: np.ndarray, nxt: np.ndarray, group: np.ndarray) -> np.ndarray
     alone[1:-1] = ~same
     pair = np.nonzero(same & alone[:-2] & alone[2:])[0] if len(order) > 1 else np.zeros(0, np.int64)
     x, y = order[pair], order[pair + 1]
-    keep = (group[x] > 0) & (group[x] == group[y])
-    x, y = x[keep], y[keep]
+    ok = (group[x] > 0) & (group[x] == group[y])
+    if wound:
+        ok &= corners[y] == corners[nxt[x]]
+    if keep is not None:
+        ok &= keep(x, y)
+    x, y = x[ok], y[ok]
     # x runs u -> v; join the corners of x's face and y's face that sit at the same vertex
     yu = np.where(corners[y] == corners[x], y, nxt[y])
     yv = np.where(corners[y] == corners[x], nxt[y], y)
@@ -458,7 +466,7 @@ def write_file(scene: Scene, path: str | os.PathLike) -> list[Path]:
             first[mesh.corners[::-1]] = np.arange(len(mesh.corners))[::-1]
             c = np.clip(np.where(first[:, None] >= 0, mesh.colors[np.maximum(first, 0), :3], 1.0), 0.0, 1.0)
             points = np.hstack([points, np.where(c <= 0.0031308, c * 12.92, 1.055 * c ** (1 / 2.4) - 0.055)])
-        lines.append(_rows("v", points))
+        lines.append(_rows("v", points, 9))  # 9 digits: world-space points far from the origin keep their place
         corner_v = mesh.corners + offsets[0]
         offsets[0] += len(mesh.positions)
         corner_vt = corner_vn = None
@@ -511,8 +519,9 @@ def _name(name: str, taken: set[str]) -> str:
     return out
 
 
-def _rows(tag: str, values: np.ndarray) -> str:
-    fmt = f"{tag}" + " %.6g" * values.shape[1]
+def _rows(tag: str, values: np.ndarray, digits: int = 6) -> str:
+    """One line per row; the first three numbers to digits significant digits, any after (colors) to 6."""
+    fmt = f"{tag}" + f" %.{digits}g" * min(values.shape[1], 3) + " %.6g" * max(values.shape[1] - 3, 0)
     return "\n".join(fmt % tuple(r) for r in values.tolist())
 
 
@@ -555,7 +564,11 @@ def _image_file(image: Image | None, folder: Path, images: dict, written: list) 
     if id(image) not in images:
         ext = _EXT.get(image.mime or "") or (Path(image.path).suffix.lstrip(".") if image.path else "") or "png"
         stem = Path((image.path or "").replace("\\", "/")).stem if image.path else image.name
-        name = _name(stem or "texture", set(images.values())) + f".{ext}"
+        base = "".join(c if c.isalnum() or c in "-_." else "_" for c in stem or "texture") or "texture"
+        taken = {n.lower() for n in images.values()}
+        name, n = f"{base}.{ext}", 1
+        while name.lower() in taken or replaces_other_file(folder, name, image.data):
+            name, n = f"{base}_{n}.{ext}", n + 1
         (folder / name).write_bytes(image.data)
         written.append(folder / name)
         images[id(image)] = name
